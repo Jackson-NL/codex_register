@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 .env
+# .env 的副本同样含明文密钥（Sub2API/SMSBower/CF Token），必须一起忽略
+.env.bak*
+.env.*.bak
 backend/data/
 backend/profiles/*/
 backend/app.db
@@ -21,6 +24,7 @@ capture/
 
 # Output (verification diffs, logs)
 output/
+.runtime/
 
 # Private one-off account maintenance scripts
 backend/scripts/backfill_rt.py
