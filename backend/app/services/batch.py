@@ -15,6 +15,47 @@ _START_LOCK = asyncio.Lock()
 # 批量/Gmail 准备日志也必须完整保留；前端限制渲染，API 正向分页限制响应体积。
 MAX_BATCH_LOG_LINES = 0
 
+# Gmail 取号退避重试：首次失败后再试 3 次（2s / 5s / 10s）。
+# 只兜住 SMSBower 与网络的偶发故障——此前一次 502 就会让整批 canceled，
+# 剩余名额全部作废且不会自动续跑。测试可直接改写本元组以免真实等待。
+GMAIL_ALIAS_RETRY_DELAYS: tuple[float, ...] = (2.0, 5.0, 10.0)
+GMAIL_ALIAS_RETRYABLE_STATUS = frozenset({502, 503, 504})
+# 余额/库存/鉴权类失败重试必然还是失败，直接终止，不做无意义退避。
+GMAIL_ALIAS_FATAL_HINTS = (
+    "insufficient_balance",
+    "no_activations",
+    "incorrect api key",
+    "ip_not_allowed",
+    "no_access",
+    "余额",
+    "api key 未配置",
+    "key 池中没有可用 key",
+)
+
+
+def _alias_error_text(error: BaseException | None) -> str:
+    """取号失败的一行化描述：优先 HTTPException.detail（业务原因）。"""
+    if error is None:
+        return "未知错误"
+    detail = getattr(error, "detail", None)
+    text = str(detail if detail not in (None, "") else error)
+    return f"{type(error).__name__}: {text[:200]}"
+
+
+def _is_retryable_alias_error(error: Exception) -> bool:
+    """判定 Gmail 取号失败值不值得重试。
+
+    4xx 表示额度/会话状态（重试没有意义，且重复租号会真实扣费），只有上游
+    5xx 与网络类异常按偶发故障处理；余额/库存/鉴权类错误再快也是失败，跳过。
+    """
+    lowered = _alias_error_text(error).lower()
+    if any(hint in lowered for hint in GMAIL_ALIAS_FATAL_HINTS):
+        return False
+    status = getattr(error, "status_code", None)
+    if status is None:
+        return True
+    return int(status or 0) in GMAIL_ALIAS_RETRYABLE_STATUS
+
 
 def normalize_batch_concurrency(requested: int, service_capacity: int, gmail_mode: bool = False) -> int:
     """将批量并发限制在注册执行器实际可用槽位内；Gmail 订单始终串行。"""
@@ -394,28 +435,16 @@ def pool_stop_reason(batch: Batch) -> str:
     return f"自定义邮箱池已耗尽（共 {len(pool)} 个地址，可用 0）"
 
 
-async def _next_gmail_alias(db, log=None) -> tuple[str, str, dict]:
-    """为 Gmail 批量注册获取下一轮地址；没有可用订单时自动租新订单。
+async def _acquire_gmail_alias(db, log) -> tuple[dict, str]:
+    """一次完整取号：没有可用订单先租新订单，再取下一轮 alias。
 
-    Clash 代理轮换失败不再硬中断 batch：仅写告警日志，继续用静态代理走完地址
-    获取流程。proxy_rotate_ok 写入 meta 供后续注册任务参考。
+    失败时原样抛出，由 _next_gmail_alias 决定是否退避重试。租号成功但取号失败
+    时，下一次尝试会看到 active 订单仍有剩余，直接复用而不会重复租号扣费。
     """
     from fastapi import HTTPException
 
     from ..api import gmail_sessions
-    from .clash_verge import rotate_clash_proxy_for_round
 
-    log = log or (lambda _message: None)
-    log("[gmail] 开始检查并切换代理出口")
-
-    proxy_rotation = await rotate_clash_proxy_for_round(log=log)
-    if proxy_rotation.get("ok") is False and not proxy_rotation.get("skipped"):
-        reason = proxy_rotation.get("error") or proxy_rotation.get("reason") or "未知错误"
-        log(f"[gmail] ⚠️ 代理轮换失败，继续使用静态代理（{reason}）")
-    log(
-        f"[proxy] 代理准备完成 before={proxy_rotation.get('before') or '?'} "
-        f"after={proxy_rotation.get('after') or '?'} ip={proxy_rotation.get('ip') or '?'}"
-    )
     active = gmail_sessions.get_active_gmail(db=db)
     order_action = "reuse_active" if active and active.remaining > 0 else "rent_new"
     log(f"[gmail] 订单策略：{order_action}")
@@ -439,6 +468,59 @@ async def _next_gmail_alias(db, log=None) -> tuple[str, str, dict]:
             item = await gmail_sessions.get_next_alias(db=db)
         else:
             raise
+    return item, order_action
+
+
+async def _next_gmail_alias(db, log=None) -> tuple[str, str, dict]:
+    """为 Gmail 批量注册获取下一轮地址；没有可用订单时自动租新订单。
+
+    Clash 代理轮换失败不再硬中断 batch：仅写告警日志，继续用静态代理走完地址
+    获取流程。proxy_rotate_ok 写入 meta 供后续注册任务参考。
+
+    取号本身按 GMAIL_ALIAS_RETRY_DELAYS 退避重试（上游 5xx / 网络类），重试用尽
+    才把最后一个异常抛给协调器终止整批；4xx 与余额/库存类失败立即抛出。
+    """
+    from .clash_verge import rotate_clash_proxy_for_round
+
+    log = log or (lambda _message: None)
+    log("[gmail] 开始检查并切换代理出口")
+
+    proxy_rotation = await rotate_clash_proxy_for_round(log=log)
+    if proxy_rotation.get("ok") is False and not proxy_rotation.get("skipped"):
+        reason = proxy_rotation.get("error") or proxy_rotation.get("reason") or "未知错误"
+        log(f"[gmail] ⚠️ 代理轮换失败，继续使用静态代理（{reason}）")
+    log(
+        f"[proxy] 代理准备完成 before={proxy_rotation.get('before') or '?'} "
+        f"after={proxy_rotation.get('after') or '?'} ip={proxy_rotation.get('ip') or '?'}"
+    )
+
+    total_attempts = len(GMAIL_ALIAS_RETRY_DELAYS) + 1
+    item: dict | None = None
+    order_action = ""
+    last_error: Exception | None = None
+    for attempt in range(1, total_attempts + 1):
+        try:
+            item, order_action = await _acquire_gmail_alias(db, log)
+            last_error = None
+            if attempt > 1:
+                log(f"[gmail] ✓ 第 {attempt}/{total_attempts} 次尝试取号成功")
+            break
+        except Exception as error:  # noqa: BLE001
+            if not _is_retryable_alias_error(error):
+                log(f"[gmail] ✗ 取号失败且不可重试：{_alias_error_text(error)}")
+                raise
+            last_error = error
+            if attempt < total_attempts:
+                delay = GMAIL_ALIAS_RETRY_DELAYS[attempt - 1]
+                log(
+                    f"[gmail] ⚠️ 第 {attempt}/{total_attempts} 次取号失败："
+                    f"{_alias_error_text(error)}；{delay:g} 秒后重试"
+                )
+                await asyncio.sleep(delay)
+
+    if item is None:
+        log(f"[gmail] ✗ 连续 {total_attempts} 次取号失败，终止本批：{_alias_error_text(last_error)}")
+        raise last_error or RuntimeError("Gmail 取号失败")
     meta = {
         "gmail_session_id": item.get("session_id"),
         "gmail_base_email": item.get("base_email", ""),

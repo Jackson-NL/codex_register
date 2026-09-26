@@ -304,6 +304,135 @@ def test_next_gmail_alias_warns_and_continues_when_proxy_rotation_failed(monkeyp
     assert not any("换 IP 失败" in m for m in messages)
 
 
+def _gmail_alias_payload(**overrides):
+    payload = {
+        "alias": "sample+reg_1@gmail.com",
+        "mail_id": "mail-1",
+        "session_id": 9,
+        "base_email": "sample@gmail.com",
+        "counter": 1,
+        "max_aliases": 3,
+        "remaining": 2,
+        "expires_at": None,
+        "expires_in_seconds": 600,
+        "exhausted": False,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _install_gmail_stubs(monkeypatch, next_alias, *, active_remaining=2, calls=None):
+    """打桩 Gmail 取号依赖：代理轮换成功、有 active 订单、alias 由用例决定。"""
+    from app.api import gmail_sessions
+    from app.services import clash_verge
+
+    async def fake_rotate(log=None, **kwargs):
+        return {
+            "ok": True, "skipped": False, "selector": "Proxy", "before": "a", "after": "b",
+            "before_ip": "1.2.3.3", "ip": "1.2.3.4", "ip_changed": True, "attempts": 1, "error": "",
+        }
+
+    class _Active:
+        remaining = active_remaining
+
+    async def fake_rent(**kwargs):
+        if calls is not None:
+            calls.append("rent")
+        return {"ok": True}
+
+    monkeypatch.setattr(clash_verge, "rotate_clash_proxy_for_round", fake_rotate)
+    monkeypatch.setattr(gmail_sessions, "get_active_gmail", lambda **kwargs: _Active())
+    monkeypatch.setattr(gmail_sessions, "rent_gmail", fake_rent)
+    monkeypatch.setattr(gmail_sessions, "get_next_alias", next_alias)
+    # 真实节奏是 2/5/10 秒，测试里必须归零，否则用例要空等 17 秒
+    monkeypatch.setattr(batch_service, "GMAIL_ALIAS_RETRY_DELAYS", (0.0, 0.0, 0.0))
+
+
+def test_next_gmail_alias_retries_transient_upstream_failure(monkeypatch):
+    """一次 502 抖动不再整批终止：退避后重试成功，且不重复租号扣费。"""
+    import asyncio
+    from fastapi import HTTPException
+
+    db = _db_session()
+    calls = []
+
+    async def flaky(**kwargs):
+        calls.append("alias")
+        if len(calls) == 1:
+            raise HTTPException(502, "SMSBower Mail 租号失败: curl 重试后仍失败")
+        return _gmail_alias_payload()
+
+    _install_gmail_stubs(monkeypatch, flaky, calls=calls)
+    messages = []
+    alias, mail_id, metadata = asyncio.run(batch_service._next_gmail_alias(db, log=messages.append))
+
+    assert alias == "sample+reg_1@gmail.com"
+    assert mail_id == "mail-1"
+    assert calls == ["alias", "alias"]
+    assert "rent" not in calls  # active 订单仍有剩余，重试不得再租一次
+    assert any("第 1/4 次取号失败" in m and "秒后重试" in m for m in messages)
+    assert any("第 2/4 次尝试取号成功" in m for m in messages)
+    assert not any("终止本批" in m for m in messages)
+
+
+def test_next_gmail_alias_stops_batch_after_exhausting_retries(monkeypatch):
+    """持续故障仍然要终止整批，但先把每次尝试的原因写进日志。"""
+    import asyncio
+    from fastapi import HTTPException
+
+    db = _db_session()
+    calls = []
+
+    async def always_fail(**kwargs):
+        calls.append("alias")
+        raise HTTPException(502, "getActivation 失败: curl error 28 timeout")
+
+    _install_gmail_stubs(monkeypatch, always_fail, calls=calls)
+    messages = []
+
+    with pytest.raises(HTTPException):
+        asyncio.run(batch_service._next_gmail_alias(db, log=messages.append))
+
+    assert len(calls) == 4
+    assert sum("次取号失败" in m for m in messages) == 4
+    assert any("连续 4 次取号失败，终止本批" in m for m in messages)
+
+
+def test_next_gmail_alias_does_not_retry_client_errors(monkeypatch):
+    """4xx 是额度/会话状态问题，重试没有意义且可能重复扣费，立即抛出。"""
+    import asyncio
+    from fastapi import HTTPException
+
+    db = _db_session()
+    calls = []
+
+    async def bad(**kwargs):
+        calls.append("alias")
+        raise HTTPException(400, "Gmail 会话状态异常")
+
+    _install_gmail_stubs(monkeypatch, bad, calls=calls)
+    messages = []
+
+    with pytest.raises(HTTPException):
+        asyncio.run(batch_service._next_gmail_alias(db, log=messages.append))
+
+    assert calls == ["alias"]
+    assert any("取号失败且不可重试" in m for m in messages)
+
+
+def test_alias_retry_classifier_separates_transient_from_terminal():
+    from fastapi import HTTPException
+
+    assert batch_service._is_retryable_alias_error(HTTPException(502, "getActivation 失败: curl 重试后仍失败")) is True
+    assert batch_service._is_retryable_alias_error(RuntimeError("connection reset")) is True
+    # 余额/库存/鉴权类：再请求一次也不会变好
+    assert batch_service._is_retryable_alias_error(HTTPException(502, "getActivation 失败: ERROR_INSUFFICIENT_BALANCE")) is False
+    assert batch_service._is_retryable_alias_error(HTTPException(502, "Key 池中没有可用 Key（order=0）")) is False
+    # 4xx 与耗尽类
+    assert batch_service._is_retryable_alias_error(HTTPException(404, "没有活跃的 Gmail 会话，请先租号")) is False
+    assert batch_service._is_retryable_alias_error(HTTPException(400, "Maximum number of codes reached")) is False
+
+
 def test_get_batch_logs_returns_incremental_persisted_lines():
     """Gmail 准备阶段没有 registration 时，前端仍可按 batch ID 增量读取日志。"""
     db = _db_session()
