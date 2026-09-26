@@ -257,7 +257,7 @@ def test_next_gmail_alias_warns_and_continues_when_proxy_rotation_failed(monkeyp
     db = _db_session()
     captured = []
 
-    async def fake_rotate(log=None):
+    async def fake_rotate(log=None, **kwargs):
         if log:
             log("[proxy] ✗ 轮换失败: 没有可用 Clash 节点")
         return {"ok": False, "error": "没有可用 Clash 节点"}
@@ -408,7 +408,7 @@ def test_next_gmail_alias_emits_pre_registration_progress(monkeypatch):
     db = _db_session()
     messages = []
 
-    async def fake_rotate(log=None):
+    async def fake_rotate(log=None, **kwargs):
         return {"ok": True, "before": "jp-a", "after": "sg-b", "ip": "1.2.3.4"}
 
     async def fake_rent(*args, **kwargs):
@@ -443,3 +443,54 @@ def test_next_gmail_alias_emits_pre_registration_progress(monkeypatch):
     assert "开始检查并切换代理出口" in joined
     assert "开始自动租用 Gmail" in joined
     assert "地址获取完成" in joined
+
+
+def test_pool_stop_reason_only_for_exhausted_custom_pool(monkeypatch):
+    """池耗尽即停：只有 cf_temp_email + custom_pool 且可用为 0 时才返回停止原因。"""
+    import uuid
+
+    from app.config import settings
+    from app.db import SessionLocal
+    from app.models import CustomMailbox
+
+    token = uuid.uuid4().hex[:8]
+    exhausted = f"batch-pool-{token}-used@example.com"
+    free = f"batch-pool-{token}-free@example.com"
+
+    db = SessionLocal()
+    try:
+        db.add_all([
+            CustomMailbox(address=exhausted, active=True, status="used"),
+            CustomMailbox(address=free, active=True, status="unused"),
+        ])
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(settings, "mail_provider", "cf_temp_email")
+    monkeypatch.setattr(settings, "cf_temp_email_enabled", True)
+    monkeypatch.setattr(settings, "cf_temp_email_address_mode", "custom_pool")
+
+    try:
+        monkeypatch.setattr(settings, "cf_temp_email_custom_pool", exhausted)
+        assert batch_service.pool_stop_reason(Batch(gmail_mode=False))
+        # Gmail 订单模式与邮箱池无关
+        assert batch_service.pool_stop_reason(Batch(gmail_mode=True)) == ""
+
+        monkeypatch.setattr(settings, "cf_temp_email_custom_pool", f"{exhausted}\n{free}")
+        assert batch_service.pool_stop_reason(Batch(gmail_mode=False)) == ""
+
+        monkeypatch.setattr(settings, "cf_temp_email_custom_pool", "")
+        assert batch_service.pool_stop_reason(Batch(gmail_mode=False))
+
+        monkeypatch.setattr(settings, "cf_temp_email_address_mode", "generated")
+        assert batch_service.pool_stop_reason(Batch(gmail_mode=False)) == ""
+    finally:
+        db = SessionLocal()
+        try:
+            db.query(CustomMailbox).filter(
+                CustomMailbox.address.in_([exhausted, free])
+            ).delete(synchronize_session=False)
+            db.commit()
+        finally:
+            db.close()

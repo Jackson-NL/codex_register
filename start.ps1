@@ -66,6 +66,8 @@ if (-not $NoRestart) {
 }
 
 $python = Find-Python
+# 后端日志含中文（池告警等），统一 UTF-8 输出，避免重定向到日志文件后乱码。
+$env:PYTHONUTF8 = "1"
 $backendLog = Join-Path $LogDir "backend.log"
 $backendErrorLog = Join-Path $LogDir "backend-error.log"
 $frontendLog = Join-Path $LogDir "frontend.log"

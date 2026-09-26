@@ -30,11 +30,20 @@ from .registrator import (
     Registrator,
     find_and_click,
     find_and_fill,
+    fill_password_with_reload,
+    emit_log,
+    set_react_input_value,
     parse_id_token,
     redact_sensitive,
     wait_spa_ready,
 )
-from .sub2api import Sub2APIClient, Sub2APIError, _extract_remote_int, is_sub2api_error_account
+from .sub2api import (
+    Sub2APIClient,
+    Sub2APIError,
+    _extract_remote_int,
+    is_sub2api_error_account,
+    sub2api_client_from_settings,
+)
 
 
 MAX_LOG_LINES = 1000
@@ -66,6 +75,18 @@ _AUTH_BUTTONS = [
     "允许",
     "确认",
 ]
+
+
+async def _submit_login_form(page) -> bool:
+    """Click the current login form submit button before generic actions."""
+    try:
+        submit = page.locator('button[type="submit"]').first
+        if await submit.count() and await submit.is_visible() and await submit.is_enabled():
+            await submit.click()
+            return True
+    except Exception:
+        pass
+    return await find_and_click(page, _AUTH_BUTTONS)
 
 
 class Sub2APIReloginSkipped(RuntimeError):
@@ -115,11 +136,37 @@ def _discard_relogin_profile_copy(profile_path: str) -> None:
     _remove_profile_path(path)
 
 
-def _make_relogin_profile_copy(profile_path: str, job_id: int, item_id: int, attempt: int) -> str:
+def _remove_browser_lock_files(profile_path: Path) -> None:
+    """Remove stale browser lock files from a disposable profile copy only."""
+    if not profile_path.exists():
+        return
+    lock_names = {
+        "parent.lock",
+        "SingletonLock",
+        "SingletonCookie",
+        "SingletonSocket",
+        ".parentlock",
+    }
+    for path in profile_path.rglob("*"):
+        if path.is_file() and path.name in lock_names:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _make_relogin_profile_copy(
+    profile_path: str,
+    job_id: int,
+    item_id: int,
+    attempt: int,
+    *,
+    fresh_profile: bool = False,
+) -> str:
     """为一次重登尝试复制工作 profile，成功前不污染账号原 profile。"""
     source = Path(profile_path).expanduser()
     target = _profile_copy_root() / f"job{job_id}_item{item_id}_try{attempt}_{uuid.uuid4().hex}"
-    if source.exists():
+    if source.exists() and not fresh_profile:
         if source.is_dir():
             shutil.copytree(source, target, symlinks=True)
         else:
@@ -127,6 +174,10 @@ def _make_relogin_profile_copy(profile_path: str, job_id: int, item_id: int, att
             shutil.copy2(source, target / source.name)
     else:
         target.mkdir(parents=True, exist_ok=True)
+    # A prior interrupted browser can leave parent.lock/Singleton* in the
+    # source profile.  They are never useful in the isolated copy and can
+    # make Camoufox hang during launch.
+    _remove_browser_lock_files(target)
     return str(target)
 
 
@@ -426,20 +477,80 @@ async def capture_oauth_callback_from_profile(
                     raise Sub2APIReloginSkipped("deactivated")
 
                 if not email_submitted:
-                    if await find_and_fill(page, _EMAIL_SELECTORS, email):
-                        email_submitted = True
-                        await page.wait_for_timeout(250)
-                        await find_and_click(page, _AUTH_BUTTONS)
+                    email_filled = False
+                    email_locator = None
+                    for selector in _EMAIL_SELECTORS:
+                        locator = page.locator(selector).first
+                        try:
+                            if not await locator.count() or not await locator.is_visible():
+                                continue
+                            await locator.fill(email)
+                            await page.wait_for_timeout(250)
+                            if str(await locator.input_value() or "") == email:
+                                email_filled = True
+                                email_locator = locator
+                                break
+                            if await set_react_input_value(locator, email):
+                                email_filled = True
+                                email_locator = locator
+                                break
+                        except Exception:
+                            continue
+                    if email_filled:
                         await page.wait_for_timeout(700)
+                        try:
+                            if email_locator is not None:
+                                await email_locator.press("Enter")
+                                await page.wait_for_timeout(500)
+                        except Exception:
+                            pass
+                        await _submit_login_form(page)
+                        await page.wait_for_timeout(1200)
+                        # Only advance the state machine after the SPA left
+                        # the email form.  A click can be accepted by the
+                        # DOM while React is still hydrating, leaving the
+                        # same email page and making the old loop skip email
+                        # forever.
+                        current_url = str(getattr(page, "url", ""))
+                        email_input_visible = False
+                        try:
+                            email_input_visible = await page.locator('input[type="email"]').first.is_visible()
+                        except Exception:
+                            pass
+                        email_submitted = not ("/log-in" in current_url and email_input_visible)
+                        if not email_submitted:
+                            emit_log(
+                                f"[sub2api] email Continue 未推进，重试邮箱提交 url={current_url[:160]} body={body_text[:500]}",
+                                flush=True,
+                            )
                         continue
 
                 if not password_submitted:
-                    if await find_and_fill(page, PASSWORD_INPUT_SELECTORS, password):
+                    # The login SPA can leave the password input mounted but
+                    # hidden for a transition tick.  Use the registrator's
+                    # reload-aware filler instead of clicking Continue again.
+                    password_filled = await fill_password_with_reload(page, password, max_reloads=1)
+                    if password_filled:
                         password_submitted = True
                         await page.wait_for_timeout(250)
-                        await find_and_click(page, _AUTH_BUTTONS)
+                        await _submit_login_form(page)
                         await page.wait_for_timeout(700)
                         continue
+                    try:
+                        fields = await page.evaluate(
+                            """() => Array.from(document.querySelectorAll('input')).map(el => ({
+                                type: el.type,
+                                name: el.name,
+                                autocomplete: el.autocomplete,
+                                visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+                            }))"""
+                        )
+                        emit_log(
+                            f"[sub2api] password input unavailable url={str(getattr(page, 'url', ''))[:160]} fields={json.dumps(fields, ensure_ascii=False)[:500]}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
 
                 if not totp_submitted:
                     try:
@@ -449,13 +560,27 @@ async def capture_oauth_callback_from_profile(
                     if await _fill_totp_code(page, totp_code):
                         totp_submitted = True
                         await page.wait_for_timeout(250)
-                        await find_and_click(page, _AUTH_BUTTONS)
+                        await _submit_login_form(page)
                         await page.wait_for_timeout(700)
                         continue
 
+                # The login/password pages also expose a generic Continue
+                # button.  Clicking it while the SPA is transitioning from
+                # email to password can reset the form indefinitely; leave
+                # those pages to the explicit credential steps above.
+                is_login_page = "/log-in" in url or "/login" in url
+                email_form_visible = False
+                try:
+                    email_form_visible = await page.locator('input[type="email"]').first.is_visible()
+                except Exception:
+                    pass
                 now = asyncio.get_running_loop().time()
-                if now - last_action >= 2:
-                    if await registrator._click_oauth_action(page):
+                # Re-read the form state before a generic action click.  The
+                # URL captured at the start of the loop can be stale during a
+                # SPA navigation; a visible email form is authoritative.
+                allow_generic_action = password_submitted or (not email_submitted and not email_form_visible)
+                if not is_login_page and allow_generic_action and now - last_action >= 2:
+                    if await registrator._click_oauth_action(page, account_email=email):
                         last_action = now
                         await page.wait_for_timeout(700)
                         continue
@@ -519,12 +644,7 @@ class Sub2APIReloginService:
 
     @staticmethod
     def _default_client_factory() -> Sub2APIClient:
-        return Sub2APIClient(
-            base_url=settings.sub2api_base_url,
-            admin_api_key=settings.sub2api_admin_api_key,
-            jwt=settings.sub2api_jwt,
-            timeout=settings.sub2api_timeout,
-        )
+        return sub2api_client_from_settings()
 
     def _new_client(self) -> Sub2APIClient:
         return self.client_factory()
@@ -564,6 +684,8 @@ class Sub2APIReloginService:
         concurrency = max(1, min(5, int(getattr(payload, "concurrency", 3) if not isinstance(payload, dict) else payload.get("concurrency", 3))))
         timeout_s = max(10, int(getattr(payload, "timeout_s", 160) if not isinstance(payload, dict) else payload.get("timeout_s", 160)))
         retry_reauth_url = max(1, min(3, int(getattr(payload, "retry_reauth_url", 2) if not isinstance(payload, dict) else payload.get("retry_reauth_url", 2))))
+        fresh_profile = bool(getattr(payload, "fresh_profile", False) if not isinstance(payload, dict) else payload.get("fresh_profile", False))
+        browser_proxy = str(getattr(payload, "browser_proxy", "") if not isinstance(payload, dict) else payload.get("browser_proxy", "") or "").strip()
         delete_deactivated = bool(getattr(payload, "delete_deactivated", False) if not isinstance(payload, dict) else payload.get("delete_deactivated", False))
         preview_items = getattr(payload, "preview_items", None) if not isinstance(payload, dict) else payload.get("preview_items")
         items = _safe_preview_items(preview_items)
@@ -585,6 +707,8 @@ class Sub2APIReloginService:
                 {
                     "timeout_s": timeout_s,
                     "retry_reauth_url": retry_reauth_url,
+                    "fresh_profile": fresh_profile,
+                    "browser_proxy": browser_proxy,
                     "delete_deactivated": delete_deactivated,
                 },
                 ensure_ascii=False,
@@ -724,7 +848,13 @@ class Sub2APIReloginService:
                 auth_url_state = _extract_state(str(auth.get("auth_url") or ""))
                 if auth_url_state and expected_state and auth_url_state != expected_state:
                     raise RegisterError("sub2api-relogin", "授权 state 不一致")
-                work_profile_path = _make_relogin_profile_copy(local.profile_path, job_id, item_id, attempt)
+                work_profile_path = _make_relogin_profile_copy(
+                    local.profile_path,
+                    job_id,
+                    item_id,
+                    attempt,
+                    fresh_profile=bool(config.get("fresh_profile", False)),
+                )
                 callback = await self.browser_capture(
                     auth_url=str(auth.get("auth_url") or ""),
                     expected_state=expected_state,
@@ -732,7 +862,7 @@ class Sub2APIReloginService:
                     password=local.password,
                     totp_secret=local.totp_secret,
                     profile_path=work_profile_path,
-                    proxy=local.proxy or "",
+                    proxy=str(config.get("browser_proxy") or local.proxy or ""),
                     headless=bool(config.get("headless", True)),
                     timeout_s=timeout_s,
                 )
@@ -747,7 +877,35 @@ class Sub2APIReloginService:
                 credentials, extra = _oauth_credentials(exchange)
                 applied = await client.apply_reauth_credentials(remote_id, credentials, extra=extra, proxy_id=proxy_id)
                 await client.clear_error(remote_id)
+                # Reauthorization repairs OAuth credentials without bypassing
+                # Sub2API's rate-limit window.  Keep scheduling enabled; the
+                # preserved rate_limited_at/rate_limit_reset_at fields continue
+                # to keep this account out of selection until the reset time.
                 await client.set_schedulable(remote_id, True)
+                # Exercise the freshly exchanged token through Sub2API's real
+                # account-test path.  A 429 is an expected quota result and
+                # must not turn an otherwise successful OAuth reauth into a
+                # failed item; other test failures are actionable and leave
+                # the remote account in its error state for a later retry.
+                test_account = getattr(client, "test_account", None)
+                if callable(test_account):
+                    test_result = await test_account(
+                        remote_id,
+                        model_id="gpt-5.6-luna",
+                        prompt="hi",
+                    )
+                    if test_result.get("rate_limited"):
+                        await self._append_log(
+                            job_id,
+                            f"账号 #{remote_id} 重登后最小请求命中 429，保留限流结果，不判定重登失败",
+                        )
+                    elif not test_result.get("success"):
+                        raise Sub2APIError(
+                            f"重登后最小请求失败：{_safe_error(test_result.get('error') or '未知错误')}",
+                            status_code=test_result.get("status_code"),
+                        )
+                    else:
+                        await self._append_log(job_id, f"账号 #{remote_id} 已用 gpt-5.6-luna 完成最小请求")
                 _commit_relogin_profile_copy(work_profile_path, local.profile_path)
                 work_profile_path = ""
                 db_update = SessionLocal()

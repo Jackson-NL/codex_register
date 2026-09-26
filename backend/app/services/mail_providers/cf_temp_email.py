@@ -5,24 +5,26 @@
 支持两种地址来源：
 - generated：通过 CF API 创建随机地址，地址自身携带收件 JWT；
 - custom_pool：从预配置地址池取地址，验证码统一从固定 inbox JWT 收取。
+
+v2 起，地址池的状态机/租约/回收逻辑全部收敛到 services.mail_pool，
+本模块只保留 Provider 接口与注册流程需要的函数签名（行为对注册侧不变）。
 """
 import asyncio
-import re
-import threading
 import time
 
 from ...config import settings
-from ...db import SessionLocal
-from ...models import CustomMailbox, utcnow
+from .. import mail_pool
 from ..tempmail import TempmailClient, TempmailError
 from .base import MailIdentity, MailProvider, MailProviderError, redact_error
 
+# 兼容旧导入路径：池的解析/校验/同步/状态查询现在以 mail_pool 为唯一实现。
+from ..mail_pool import (  # noqa: F401  (re-export for mail_providers 与测试)
+    mask_custom_pool_sample,
+    parse_custom_pool,
+    sync_custom_mailbox_pool,
+    validate_custom_pool,
+)
 
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-_POOL_LOCK = threading.Lock()
-_POOL_ACTIVE: dict[tuple[tuple[str, ...], str], set[str]] = {}
-_POOL_RESERVATIONS: dict[str, tuple[tuple[str, ...], str]] = {}
-_POOL_CURSOR: dict[tuple[tuple[str, ...], str], int] = {}
 _CUSTOM_REGISTRATION_LOCK: asyncio.Lock | None = None
 
 
@@ -34,150 +36,22 @@ def custom_registration_lock() -> asyncio.Lock:
     return _CUSTOM_REGISTRATION_LOCK
 
 
-def parse_custom_pool(pool_text: str) -> list[str]:
-    """解析自定义地址池；每行一个地址，忽略空行和 # 注释。"""
-    addresses: list[str] = []
-    seen: set[str] = set()
-    for raw_line in (pool_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        address = raw_line.strip().lower()
-        if not address or address.startswith("#"):
-            continue
-        if _EMAIL_RE.match(address) and address not in seen:
-            addresses.append(address)
-            seen.add(address)
-    return addresses
-
-
-def validate_custom_pool(pool_text: str) -> tuple[list[str], list[str]]:
-    """返回有效地址和不包含敏感信息的格式错误。"""
-    addresses: list[str] = []
-    errors: list[str] = []
-    seen: set[str] = set()
-    for index, raw_line in enumerate((pool_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"), 1):
-        address = raw_line.strip().lower()
-        if not address or address.startswith("#"):
-            continue
-        if not _EMAIL_RE.match(address):
-            errors.append(f"第 {index} 行邮箱格式不正确")
-            continue
-        if address in seen:
-            errors.append(f"第 {index} 行邮箱重复")
-            continue
-        seen.add(address)
-        addresses.append(address)
-    return addresses, errors
-
-
-def mask_custom_pool_sample(address: str) -> str:
-    local, _, domain = address.partition("@")
-    if len(local) <= 3:
-        local = f"{local[:1]}***"
-    else:
-        local = f"{local[:2]}***{local[-1]}"
-    return f"{local}@{domain}"
-
-
-def sync_custom_mailbox_pool(pool: list[str]) -> None:
-    """将配置地址池同步到持久化状态表，不重置既有使用记录。"""
-    normalized = {str(address).strip().lower() for address in pool if str(address).strip()}
-    db = SessionLocal()
-    try:
-        existing = {item.address: item for item in db.query(CustomMailbox).all()}
-        for address in normalized:
-            item = existing.get(address)
-            if item is None:
-                db.add(CustomMailbox(address=address, active=True, status="unused"))
-            else:
-                item.active = True
-                item.updated_at = utcnow()
-        for address, item in existing.items():
-            if address not in normalized and item.active:
-                item.active = False
-                item.updated_at = utcnow()
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
-
 def custom_mailbox_pool_state(pool: list[str]) -> tuple[dict[str, int], list[dict]]:
-    """返回当前池的脱敏状态清单，地址明文不离开后端。"""
-    sync_custom_mailbox_pool(pool)
-    db = SessionLocal()
-    try:
-        items = db.query(CustomMailbox).filter(CustomMailbox.active.is_(True)).order_by(CustomMailbox.id).all()
-        counts = {status: 0 for status in ("unused", "in_use", "used", "failed")}
-        result = []
-        for item in items:
-            counts[item.status] = counts.get(item.status, 0) + 1
-            result.append({
-                "id": item.id,
-                "address": mask_custom_pool_sample(item.address),
-                "status": item.status,
-                "allocated_at": item.allocated_at.isoformat() if item.allocated_at else None,
-                "used_at": item.used_at.isoformat() if item.used_at else None,
-            })
-        return counts, result
-    finally:
-        db.close()
+    """兼容旧接口：返回 (counts, items)；明细已带 v2 生命周期字段。"""
+    return mail_pool.state(pool)
 
 
-def release_custom_mailbox(address: str, *, outcome: str = "failed", error: str = "") -> None:
-    """结束地址占用并写入终态；成功后不再回收到可分配池。"""
-    normalized = (address or "").strip().lower()
-    if not normalized:
-        return
-    with _POOL_LOCK:
-        key = _POOL_RESERVATIONS.pop(normalized, None)
-        if key:
-            _POOL_ACTIVE.get(key, set()).discard(normalized)
-    db = SessionLocal()
-    try:
-        item = db.query(CustomMailbox).filter(CustomMailbox.address == normalized).one_or_none()
-        if item and item.status == "in_use":
-            item.status = "used" if outcome == "used" else "failed"
-            item.used_at = utcnow()
-            item.last_error = "" if outcome == "used" else str(error or "注册未完成")[:500]
-            item.updated_at = utcnow()
-            db.commit()
-    except Exception:
-        db.rollback()
-    finally:
-        db.close()
+def release_custom_mailbox(address: str, *, outcome: str = "failed", error: str = "") -> str:
+    """结束地址占用（v2：按失败分类自动回收可证明未消费的地址）。"""
+    return mail_pool.release(address, outcome=outcome, error=error)
 
 
 def _reserve_custom_mailbox(pool: list[str], inbox_address: str) -> str:
-    sync_custom_mailbox_pool(pool)
-    key = (tuple(pool), inbox_address.lower())
-    with _POOL_LOCK:
-        active = _POOL_ACTIVE.setdefault(key, set())
-        start = _POOL_CURSOR.get(key, 0)
-        db = SessionLocal()
-        try:
-            states = {item.address: item for item in db.query(CustomMailbox).filter(CustomMailbox.active.is_(True)).all()}
-            for offset in range(len(pool)):
-                index = (start + offset) % len(pool)
-                address = pool[index]
-                item = states.get(address)
-                if address in active or item is None or item.status != "unused":
-                    continue
-                item.status = "in_use"
-                item.allocated_at = utcnow()
-                item.last_error = ""
-                item.updated_at = utcnow()
-                db.commit()
-                active.add(address)
-                _POOL_RESERVATIONS[address] = key
-                _POOL_CURSOR[key] = (index + 1) % len(pool)
-                return address
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
-    raise MailProviderError(f"自定义邮箱池已耗尽：当前 {len(pool)} 个地址均已使用或不可用")
+    """从池中原子占用一个地址（v2：写租约，崩溃后可由收敛器回收）。"""
+    try:
+        return mail_pool.allocate(pool, inbox_address)
+    except mail_pool.PoolExhaustedError as exc:
+        raise MailProviderError(str(exc)) from exc
 
 
 class CFTempEmailProvider(MailProvider):
@@ -204,7 +78,7 @@ class CFTempEmailProvider(MailProvider):
                 raise MailProviderError("自定义邮箱池格式错误：" + "；".join(self.pool_errors))
             if not self.custom_pool:
                 raise MailProviderError("自定义邮箱池为空，请先在「邮箱配置」中添加邮箱")
-            if not _EMAIL_RE.match(self.inbox_address):
+            if not mail_pool.is_valid_email(self.inbox_address):
                 raise MailProviderError("固定收件邮箱格式不正确")
             if not self.inbox_jwt:
                 raise MailProviderError("固定收件邮箱缺少 JWT 凭证")
@@ -214,7 +88,8 @@ class CFTempEmailProvider(MailProvider):
                 mails = await self.client.list_parsed_mails(self.inbox_jwt, limit=50)
                 cursor = max((int(item.get("id")) for item in mails if str(item.get("id", "")).isdigit()), default=0)
             except Exception as exc:  # noqa: BLE001
-                release_custom_mailbox(address)
+                # 取号阶段收件箱不可用：邮箱尚未提交给 OpenAI，可证明未消费 → 自动回收。
+                release_custom_mailbox(address, error="固定收件箱不可用")
                 raise MailProviderError(f"cf_temp_email 固定收件箱不可用: {redact_error(exc)}") from exc
             return MailIdentity(
                 provider=self.name,
@@ -269,7 +144,7 @@ class CFTempEmailProvider(MailProvider):
                     }
                 if not self.custom_pool:
                     raise MailProviderError("自定义邮箱池为空")
-                if not _EMAIL_RE.match(self.inbox_address):
+                if not mail_pool.is_valid_email(self.inbox_address):
                     raise MailProviderError("固定收件邮箱格式不正确")
                 if not self.inbox_jwt:
                     raise MailProviderError("固定收件邮箱缺少 JWT 凭证")

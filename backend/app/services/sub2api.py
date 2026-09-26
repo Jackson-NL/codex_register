@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 import re
@@ -10,12 +11,54 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..config import settings
 from ..models import Account, AccountSub2APIUpload, utcnow
 from .registrator import OAUTH_CLIENT_ID
 from .token_utils import parse_jwt_exp
 
 
 RequestFn = Callable[..., Awaitable[httpx.Response]]
+
+
+# 远端返回的机器码 -> 本地化处理建议。只映射固定文案，不透传远端响应正文。
+SUB2API_ERROR_HINTS = {
+    "REGION_NOT_SUPPORTED": (
+        "Sub2API 按出口地区准入，当前 IP 被拒绝；请检查 SUB2API_PROXY 是否指向受支持地区的代理"
+    ),
+    "ACCESS_DENIED": "Sub2API 拒绝访问该管理接口，请确认使用的是管理员凭据",
+    "UNAUTHORIZED": "Sub2API 认证失败，请检查管理员 API Key 或 JWT 是否有效",
+}
+# 强制直连的取值：区域不受限的自建/内网 Sub2API 用它绕过 default_proxy 回退。
+# 注意不含空串 —— 空串表示「未配置」，回退到 default_proxy。
+SUB2API_DIRECT_PROXY_ALIASES = {"direct", "none", "off", "no", "d"}
+CLOUDFLARE_BLOCK_RE = re.compile(
+    r"just a moment|attention required|cf-browser-verification|cloudflare|error codes? 1[0-9]{3}",
+    re.IGNORECASE,
+)
+SUB2API_RESPONSE_CODE_RE = re.compile(r'"code"\s*:\s*"([A-Za-z0-9_]{2,48})"')
+
+
+def resolve_sub2api_proxy(explicit: str | None = None, default_proxy: str | None = None) -> str:
+    """解析 Sub2API 出口代理：显式配置 > default_proxy 回退；direct/none 等哨兵表示直连。"""
+    raw = str(settings.sub2api_proxy if explicit is None else explicit).strip()
+    if raw.lower() in SUB2API_DIRECT_PROXY_ALIASES:
+        return ""
+    if raw:
+        return raw
+    return str(default_proxy if default_proxy is not None else settings.default_proxy).strip()
+
+
+def describe_sub2api_http_error(status_code: int, body: str) -> str:
+    """把非 2xx 响应翻译成可诊断文案；body 只用于匹配，不会拼进返回值。"""
+    sample = str(body or "")[:4096]
+    match = SUB2API_RESPONSE_CODE_RE.search(sample)
+    code = match.group(1).upper() if match else ""
+    hint = SUB2API_ERROR_HINTS.get(code)
+    if hint:
+        return f"Sub2API 返回 HTTP {status_code}：{hint}（{code}）"
+    if status_code in (401, 403) and not code and CLOUDFLARE_BLOCK_RE.search(sample):
+        return f"Sub2API 返回 HTTP {status_code}：请求被 CDN/WAF 拦截，请更换出口节点或稍后重试"
+    return f"Sub2API 返回 HTTP {status_code}"
 
 
 class Sub2APIError(RuntimeError):
@@ -621,11 +664,13 @@ class Sub2APIClient:
         jwt: str = "",
         timeout: float = 30,
         request: RequestFn | None = None,
+        proxy: str = "",
     ):
         self.base_url = base_url.rstrip("/")
         self.admin_api_key = admin_api_key.strip()
         self.jwt = jwt.strip()
         self.timeout = timeout
+        self.proxy = str(proxy or "").strip()
         self._request_fn = request or self._request
         self._http_client: httpx.AsyncClient | None = None
 
@@ -638,10 +683,13 @@ class Sub2APIClient:
 
     async def _request(self, method: str, url: str, headers: dict[str, str], json: dict | None = None) -> httpx.Response:
         if self._http_client is None or self._http_client.is_closed:
-            self._http_client = httpx.AsyncClient(
-                timeout=self.timeout,
-                limits=httpx.Limits(max_connections=20, max_keepalive_connections=20, keepalive_expiry=30),
-            )
+            kwargs: dict[str, Any] = {
+                "timeout": self.timeout,
+                "limits": httpx.Limits(max_connections=20, max_keepalive_connections=20, keepalive_expiry=30),
+            }
+            if self.proxy:
+                kwargs["proxy"] = self.proxy
+            self._http_client = httpx.AsyncClient(**kwargs)
         return await self._http_client.request(method, url, headers=headers, json=json)
 
     async def aclose(self) -> None:
@@ -652,6 +700,20 @@ class Sub2APIClient:
         self._http_client = None
         await client.aclose()
 
+    def _connect_error(self, error: Exception) -> Sub2APIError:
+        if self.proxy:
+            return Sub2APIError(
+                f"无法通过代理 {self.proxy} 连接 Sub2API（{type(error).__name__}），请确认代理已启动",
+                fatal=True,
+            )
+        return Sub2APIError(f"Sub2API 请求失败（{type(error).__name__}）", fatal=True)
+
+    def _response_text(self, response: httpx.Response) -> str:
+        try:
+            return str(response.text or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
     async def _call(self, method: str, path: str, body: dict | None = None) -> Any:
         if not self.base_url:
             raise Sub2APIError("未配置 Sub2API 地址", fatal=True)
@@ -661,10 +723,10 @@ class Sub2APIClient:
         except Sub2APIError:
             raise
         except Exception as error:  # noqa: BLE001
-            raise Sub2APIError(f"Sub2API 请求失败（{type(error).__name__}）", fatal=True) from error
+            raise self._connect_error(error) from error
         if not 200 <= response.status_code < 300:
             raise Sub2APIError(
-                f"Sub2API 返回 HTTP {response.status_code}",
+                describe_sub2api_http_error(response.status_code, self._response_text(response)),
                 status_code=response.status_code,
                 fatal=response.status_code in (401, 403),
             )
@@ -1148,6 +1210,106 @@ class Sub2APIClient:
         data = self._unwrap_data(payload)
         return data if isinstance(data, dict) else {}
 
+    async def test_account(
+        self,
+        account_id: str,
+        *,
+        model_id: str = "gpt-5.6-luna",
+        prompt: str = "hi",
+        mode: str = "",
+    ) -> dict[str, Any]:
+        """Run Sub2API's real account connectivity test and consume its SSE body.
+
+        The admin endpoint returns HTTP 200 for both successful and upstream
+        failures, with the actual verdict encoded as SSE ``data:`` events.
+        A 429 is returned as a non-fatal result so callers can preserve the
+        account's existing rate-limit state while still recording the probe.
+        """
+        remote_id = quote(str(account_id).strip(), safe="")
+        if not remote_id:
+            raise ValueError("缺少 Sub2API 账号 ID")
+        body = {
+            "model_id": str(model_id or "gpt-5.6-luna").strip() or "gpt-5.6-luna",
+            "prompt": str(prompt or "hi"),
+            "mode": str(mode or ""),
+        }
+        url = urljoin(f"{self.base_url}/", f"/api/v1/admin/accounts/{remote_id}/test")
+        try:
+            response = await self._request_fn("POST", url, self._headers(), json=body)
+        except Sub2APIError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            raise Sub2APIError(f"Sub2API 账号测试请求失败（{type(error).__name__}）", fatal=True) from error
+
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if status_code >= 400:
+            rate_limited = status_code == 429
+            if status_code in (401, 403):
+                raise Sub2APIError(
+                    describe_sub2api_http_error(status_code, getattr(response, "text", "") or ""),
+                    status_code=status_code,
+                    fatal=True,
+                )
+            return {
+                "success": False,
+                "rate_limited": rate_limited,
+                "status_code": status_code,
+                "error": f"Sub2API 账号测试返回 HTTP {status_code}",
+            }
+
+        try:
+            raw = str(response.text or "")
+        except Exception:  # noqa: BLE001
+            raw = ""
+        events: list[dict[str, Any]] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                event = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+
+        error_text = ""
+        for event in events:
+            if str(event.get("type") or "").lower() == "error":
+                error_text = _as_text(event.get("error")) or "账号测试失败"
+                break
+        complete = next(
+            (
+                event
+                for event in reversed(events)
+                if str(event.get("type") or "").lower() == "test_complete"
+            ),
+            None,
+        )
+        if complete is not None and bool(complete.get("success")) and not error_text:
+            return {
+                "success": True,
+                "rate_limited": False,
+                "status_code": status_code,
+                "events": len(events),
+            }
+
+        lowered_error = error_text.lower()
+        rate_limited = bool(
+            status_code == 429
+            or re.search(r"\b429\b|too many requests|rate.?limit|限流", lowered_error, re.IGNORECASE)
+        )
+        return {
+            "success": False,
+            "rate_limited": rate_limited,
+            "status_code": status_code,
+            "error": error_text or "账号测试未返回成功事件",
+            "events": len(events),
+        }
+
     async def batch_refresh(self, account_ids: list[str]) -> dict[str, Any]:
         # Current Sub2API expects numeric account_ids as JSON numbers. Keep
         # non-numeric IDs intact for older/deployed variants that use UUIDs.
@@ -1443,3 +1605,18 @@ class Sub2APIClient:
 
         counters["matched_remote"] = len(matched_local_ids)
         return {**counters, "group_ids": normalized_group_ids, "items": items}
+
+
+def sub2api_client_from_settings(timeout: float | None = None, proxy: str | None = None) -> Sub2APIClient:
+    """按后端配置构造 Sub2API 客户端。
+
+    统一在这里带上出口代理：Sub2API 部署侧按地区准入，直连会被回 HTTP 403
+    REGION_NOT_SUPPORTED，各处自行 new Sub2APIClient() 极易漏配。
+    """
+    return Sub2APIClient(
+        base_url=settings.sub2api_base_url,
+        admin_api_key=settings.sub2api_admin_api_key,
+        jwt=settings.sub2api_jwt,
+        timeout=settings.sub2api_timeout if timeout is None else timeout,
+        proxy=resolve_sub2api_proxy(proxy),
+    )

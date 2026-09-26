@@ -17,6 +17,7 @@ from ..schemas import (
     MailConfigTestRequest,
     MailConfigUpdate,
     OutlookConfig,
+    PoolActionRequest,
 )
 from ..services.mail_providers import validate_outlook_pool
 from ..services.mail_providers.base import redact_error
@@ -68,10 +69,12 @@ def _persist_cf_custom_pool(value: str) -> None:
 
 
 def _config_out() -> MailConfigOut:
-    from ..services.mail_providers import custom_mailbox_pool_state, mask_custom_pool_sample, validate_custom_pool
+    from ..services import mail_pool
 
-    custom_pool, _ = validate_custom_pool(settings.cf_temp_email_custom_pool)
-    custom_pool_status_counts, custom_pool_items = custom_mailbox_pool_state(custom_pool)
+    custom_pool, _ = mail_pool.validate_custom_pool(settings.cf_temp_email_custom_pool)
+    pool_snapshot = mail_pool.snapshot(custom_pool)
+    custom_pool_status_counts = pool_snapshot["counts"]
+    custom_pool_items = pool_snapshot["items"]
     accounts = _outlook_accounts()
     return MailConfigOut(
         provider=settings.mail_provider or "cf_temp_email",
@@ -81,9 +84,10 @@ def _config_out() -> MailConfigOut:
             domain=settings.cf_temp_email_domain,
             address_mode=settings.cf_temp_email_address_mode or "generated",
             custom_pool_count=len(custom_pool),
-            custom_pool_sample=[mask_custom_pool_sample(address) for address in custom_pool[:3]],
+            custom_pool_sample=[mail_pool.mask_custom_pool_sample(address) for address in custom_pool[:3]],
             custom_pool_status_counts=custom_pool_status_counts,
             custom_pool_items=custom_pool_items,
+            custom_pool_summary=pool_snapshot["summary"],
             inbox_address=settings.cf_temp_email_inbox_address,
             has_inbox_jwt=bool(settings.cf_temp_email_inbox_jwt),
             name_prefix=settings.cf_temp_email_name_prefix,
@@ -153,7 +157,23 @@ def update_mail_config(payload: MailConfigUpdate):
         # 敏感字段：占位符/空串表示不修改
         site_password = data.pop("site_password", None)
         custom_pool = data.pop("custom_pool", None)
+        custom_pool_append = bool(data.pop("custom_pool_append", None))
         inbox_jwt = data.pop("inbox_jwt", None)
+        if custom_pool is not None and custom_pool_append:
+            # 追加导入：与已保存池合并（保留既有使用记录，仅新增缺失地址）。
+            # 已保存地址明文不回显前端，追加只能在后端做。
+            from ..services.mail_providers import parse_custom_pool, validate_custom_pool
+
+            _, append_errors = validate_custom_pool(custom_pool)
+            if append_errors:
+                raise HTTPException(422, "自定义邮箱池格式错误：\n" + "\n".join(append_errors))
+            merged = parse_custom_pool(settings.cf_temp_email_custom_pool)
+            seen = set(merged)
+            for address in parse_custom_pool(custom_pool):
+                if address not in seen:
+                    merged.append(address)
+                    seen.add(address)
+            custom_pool = "\n".join(merged)
         for key in ("base_url", "domain", "name_prefix"):
             if key in data and isinstance(data[key], str):
                 data[key] = data[key].strip()
@@ -268,3 +288,74 @@ async def test_mail_config(payload: MailConfigTestRequest):
     result["tested_at"] = _utc_iso()
     _last_test = result
     return result
+
+
+# ---------- 邮箱池运维（v2 生命周期） ----------
+
+@router.post("/pool/requeue")
+def pool_requeue(payload: PoolActionRequest):
+    """失败地址 → 可用；pre_submit（可证明未消费）直接放行，其余需 force。"""
+    from ..services import mail_pool
+
+    return mail_pool.requeue(payload.ids, force=bool(payload.force))
+
+
+@router.post("/pool/release")
+def pool_release(payload: PoolActionRequest):
+    """人工释放卡住的「使用中」地址；outcome=unused 放回池，failed 保守标失败。"""
+    from ..services import mail_pool
+
+    return mail_pool.force_release(payload.ids, outcome=payload.outcome or "unused")
+
+
+@router.post("/pool/disable")
+def pool_disable(payload: PoolActionRequest):
+    """停用地址（使用中的不能停用）。"""
+    from ..services import mail_pool
+
+    return mail_pool.set_enabled(payload.ids, enabled=False)
+
+
+@router.post("/pool/enable")
+def pool_enable(payload: PoolActionRequest):
+    """启用已停用地址（回到可用）。"""
+    from ..services import mail_pool
+
+    return mail_pool.set_enabled(payload.ids, enabled=True)
+
+
+@router.post("/pool/verify")
+def pool_verify(payload: PoolActionRequest):
+    """刷新已使用地址的凭据快照（是否拿到 refresh_token）。"""
+    from ..services import mail_pool
+
+    affected = mail_pool.verify_credentials(payload.ids or None)
+    return {"ok": True, "affected": affected, "skipped": []}
+
+
+@router.post("/pool/remove")
+def pool_remove(payload: PoolActionRequest):
+    """从地址池中移除地址（仅移除池成员，不影响账号管理中的账号）。
+
+    使用中的地址需先释放；移除会同步写入 .env 并更新地址池状态表。
+    """
+    from ..services import mail_pool
+
+    outcome = mail_pool.prepare_removal(payload.ids)
+    removed = outcome["addresses"]
+    remaining = [
+        address
+        for address in mail_pool.parse_custom_pool(settings.cf_temp_email_custom_pool)
+        if address not in set(removed)
+    ]
+    if removed:
+        pool_text = "\n".join(remaining)
+        settings.cf_temp_email_custom_pool = pool_text
+        _persist_cf_custom_pool(pool_text)
+        mail_pool.sync_custom_mailbox_pool(remaining)
+    return {
+        "ok": True,
+        "affected": len(removed),
+        "skipped": outcome["skipped"],
+        "remaining": len(remaining),
+    }

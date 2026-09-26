@@ -9,7 +9,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.api import mail_config
 from app.config import settings
-from app.schemas import CFTempEmailUpdate, MailConfigUpdate
+from app.db import SessionLocal
+from app.models import CustomMailbox
+from app.schemas import CFTempEmailUpdate, MailConfigUpdate, PoolActionRequest
 from app.services.mail_providers.base import get_mail_provider
 from app.services.mail_providers.cf_temp_email import (
     CFTempEmailProvider,
@@ -132,6 +134,76 @@ def test_custom_pool_config_can_be_saved_without_exposing_credentials(monkeypatc
     assert result.cf_temp_email.address_mode == "custom_pool"
     assert result.cf_temp_email.custom_pool_count == 2
     assert result.cf_temp_email.has_inbox_jwt is True
+
+
+def _enable_custom_pool(monkeypatch, pool: str) -> None:
+    monkeypatch.setattr(settings, "cf_temp_email_enabled", True)
+    monkeypatch.setattr(settings, "cf_temp_email_address_mode", "custom_pool")
+    monkeypatch.setattr(settings, "cf_temp_email_custom_pool", pool)
+    monkeypatch.setattr(settings, "cf_temp_email_inbox_address", "jackson@708651.xyz")
+    monkeypatch.setattr(settings, "cf_temp_email_inbox_jwt", "jwt-value")
+    monkeypatch.setattr(mail_config, "_persist_env", lambda *args: None)
+    monkeypatch.setattr(mail_config, "_persist_cf_custom_pool", lambda *args: None)
+
+
+def test_custom_pool_append_merges_with_saved_pool(monkeypatch):
+    _enable_custom_pool(monkeypatch, "first@example.com\nsecond@example.com")
+
+    result = mail_config.update_mail_config(
+        MailConfigUpdate(
+            cf_temp_email={
+                "custom_pool": "second@example.com\nthird@example.com",
+                "custom_pool_append": True,
+            }
+        )
+    )
+
+    assert settings.cf_temp_email_custom_pool.splitlines() == [
+        "first@example.com",
+        "second@example.com",
+        "third@example.com",
+    ]
+    assert result.cf_temp_email.custom_pool_count == 3
+
+
+def test_custom_pool_without_append_still_replaces_saved_pool(monkeypatch):
+    _enable_custom_pool(monkeypatch, "first@example.com\nsecond@example.com")
+
+    result = mail_config.update_mail_config(
+        MailConfigUpdate(cf_temp_email={"custom_pool": "third@example.com"})
+    )
+
+    assert settings.cf_temp_email_custom_pool == "third@example.com"
+    assert result.cf_temp_email.custom_pool_count == 1
+
+
+def test_pool_remove_deletes_address_from_saved_pool(monkeypatch):
+    keep = f"keep-{uuid4().hex[:8]}@example.com"
+    drop = f"drop-{uuid4().hex[:8]}@example.com"
+    _enable_custom_pool(monkeypatch, f"{keep}\n{drop}")
+    sync_custom_mailbox_pool([keep, drop])
+
+    db = SessionLocal()
+    try:
+        item = db.query(CustomMailbox).filter(CustomMailbox.address == drop).one()
+        item_id = item.id
+        db.expunge(item)
+    finally:
+        db.close()
+
+    try:
+        result = mail_config.pool_remove(PoolActionRequest(ids=[item_id]))
+
+        assert result["affected"] == 1
+        assert result["remaining"] == 1
+        assert settings.cf_temp_email_custom_pool == keep
+    finally:
+        db = SessionLocal()
+        try:
+            db.query(CustomMailbox).filter(CustomMailbox.address.in_([keep, drop])).delete(synchronize_session=False)
+            db.commit()
+        finally:
+            db.close()
 
 
 def test_tempmail_cursor_ignores_old_fixed_inbox_codes(monkeypatch):

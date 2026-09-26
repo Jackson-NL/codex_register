@@ -173,6 +173,7 @@ const EN = {
   "管理员 API Key": "Admin API key",
   "管理员 JWT": "Admin JWT",
   "请求超时（秒）": "Request timeout (seconds)",
+  "出口代理": "Egress proxy",
   "默认上传分组 ID": "Default upload group IDs",
   "测试超时（秒）": "Test timeout (seconds)",
   "最大可用延迟（ms）": "Maximum latency (ms)",
@@ -314,6 +315,8 @@ const EN = {
   "优先使用 x-api-key 认证": "Prefer x-api-key authentication",
   "未配置 API Key 时作为备用认证": "Fallback authentication when no API key is configured",
   "获取分组和上传账号的单次请求超时": "Single-request timeout for loading groups and uploading accounts",
+  "Sub2API 按出口 IP 地区准入，直连常返回 403 REGION_NOT_SUPPORTED。留空=沿用「默认代理」；填 direct 强制直连（自建/内网部署时用）":
+    "Sub2API gates access by egress IP region; direct connections often return 403 REGION_NOT_SUPPORTED. Leave empty to reuse the default proxy; set direct to force a direct connection (self-hosted or LAN deployments)",
   "逗号分隔，可填多个分组 ID；账号管理上传时默认使用，也可在弹窗临时修改": "Comma-separated group IDs; used by default for account uploads and editable in the dialog",
   "代理连通性测试的等待超时": "Wait timeout for proxy connectivity tests",
   "超过此延迟的代理标记为降级": "Mark proxies above this latency as degraded",

@@ -223,6 +223,35 @@ def _migrate_legacy_tables(target_engine=None):
         from . import models  # noqa: F401
         Base.metadata.create_all(bind=engine)
 
+    # ---------- custom_mailboxes（自定义邮箱池 v2 生命周期字段） ----------
+    if "custom_mailboxes" in tables:
+        cols = tables["custom_mailboxes"]
+        with engine.begin() as conn:
+            for column_name, column_type in (
+                ("reason_code", "VARCHAR(32) DEFAULT ''"),
+                ("lease_owner", "VARCHAR(64) DEFAULT ''"),
+                ("lease_expires_at", "DATETIME"),
+                ("attempt_count", "INTEGER DEFAULT 0"),
+                ("recycle_count", "INTEGER DEFAULT 0"),
+                ("account_id", "INTEGER"),
+                ("has_refresh_token", "BOOLEAN"),
+                ("credential_checked_at", "DATETIME"),
+            ):
+                if column_name not in cols:
+                    conn.execute(text(f"ALTER TABLE custom_mailboxes ADD COLUMN {column_name} {column_type}"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_custom_mailboxes_status ON custom_mailboxes (status)"))
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_custom_mailboxes_lease_expires_at ON custom_mailboxes (lease_expires_at)")
+            )
+            # 历史 in_use 没有租约：把过期时间视为已到期，收敛器启动时会保守回收，
+            # 避免崩溃残留（如卡住多日的僵尸占用）永久占用地址。
+            conn.execute(
+                text(
+                    "UPDATE custom_mailboxes SET lease_expires_at = COALESCE(allocated_at, datetime('now')) "
+                    "WHERE status = 'in_use' AND lease_expires_at IS NULL"
+                )
+            )
+
     # Sub2API 重登表在旧数据库中不存在时由 create_all 创建；若运行中的旧库
     # 已经提前创建了部分字段，则用 SQLite 兼容的 ADD COLUMN 补齐，不删除历史任务。
     Base.metadata.create_all(bind=engine)

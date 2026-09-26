@@ -8,7 +8,6 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 import re
 
-from ..config import settings
 from ..db import SessionLocal, get_db
 from ..models import Account, AccountSub2APIUpload
 from ..schemas import Sub2APIUploadStatusOut, Sub2APIUploadStatusSyncBody
@@ -17,6 +16,7 @@ from ..services.sub2api import (
     Sub2APIClient,
     Sub2APIError,
     filter_sub2api_upload_accounts,
+    sub2api_client_from_settings,
     write_sub2api_upload_status_rows,
 )
 
@@ -49,12 +49,7 @@ class Sub2APIUploadBody(BaseModel):
 
 
 def create_sub2api_client() -> Sub2APIClient:
-    return Sub2APIClient(
-        base_url=settings.sub2api_base_url,
-        admin_api_key=settings.sub2api_admin_api_key,
-        jwt=settings.sub2api_jwt,
-        timeout=settings.sub2api_timeout,
-    )
+    return sub2api_client_from_settings()
 
 
 def _decorate_sub2api_upload_result(

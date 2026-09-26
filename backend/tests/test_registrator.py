@@ -2592,6 +2592,133 @@ class OAuthFromProfileTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["access_token"], "oauth-access")
         self.assertEqual(result["phone_activation_id"], "act-2")
 
+    async def test_oauth_from_profile_with_phone_attempts_recovers_login_after_account_selection(self):
+        from app.services import registrator as registrator_module
+
+        events = {}
+        recovery_urls = []
+
+        class FakeLocator:
+            @property
+            def first(self):
+                return self
+
+            async def count(self):
+                return 0
+
+            async def is_visible(self):
+                return False
+
+        class FakePage:
+            main_frame = object()
+
+            def __init__(self):
+                self.url = "about:blank"
+
+            def on(self, name, callback):
+                events[name] = callback
+
+            async def goto(self, url, **kwargs):
+                self.url = "https://auth.openai.com/choose-an-account"
+
+            async def wait_for_timeout(self, ms):
+                return None
+
+            def locator(self, *args, **kwargs):
+                return FakeLocator()
+
+            def get_by_role(self, *args, **kwargs):
+                return FakeLocator()
+
+        class FakeContext:
+            def __init__(self):
+                self.pages = [FakePage()]
+
+        fake_context = FakeContext()
+
+        class FakeCamoufox:
+            def __init__(self, **options):
+                pass
+
+            async def __aenter__(self):
+                return fake_context
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        class FakeListener:
+            def __init__(self, redirect_uri, expected_state):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def wait(self, timeout):
+                raise AssertionError("request event should capture the callback")
+
+        async def fake_fetch_authorize(*args, **kwargs):
+            return "https://auth.example/authorize"
+
+        async def fake_recover(self, page, **kwargs):
+            recovery_urls.append(page.url)
+            if len(recovery_urls) == 1:
+                return False
+            page.url = "http://localhost:1455/auth/callback?code=reauth-phone&state=state-phone"
+            events["request"](type("Req", (), {"url": page.url})())
+            return True
+
+        async def fake_click(self, page, account_email=""):
+            if "choose-an-account" in page.url:
+                page.url = "https://auth.openai.com/log-in/password"
+                return True
+            return False
+
+        async def fake_exchange_code(code, verifier, redirect_uri, proxy):
+            self.assertEqual(code, "reauth-phone")
+            return {
+                "access_token": "reauth-access",
+                "refresh_token": "reauth-refresh",
+                "id_token": "reauth-id",
+                "expires_in": 3600,
+            }
+
+        async def rent_next_phone():
+            return None
+
+        with (
+            patch.object(registrator_module, "AsyncCamoufox", FakeCamoufox),
+            patch.object(registrator_module, "OAuthCallbackListener", FakeListener),
+            patch.object(registrator_module, "generate_pkce", return_value={"verifier": "verifier", "challenge": "challenge"}),
+            patch.object(registrator_module, "b64url", return_value="state-phone"),
+            patch.object(registrator_module, "fetch_authorize", side_effect=fake_fetch_authorize),
+            patch.object(registrator_module.Registrator, "_recover_oauth_login", new=fake_recover),
+            patch.object(registrator_module.Registrator, "_click_oauth_action", new=fake_click),
+            patch.object(registrator_module.Registrator, "_handle_oauth_mfa_challenge", new=AsyncMock(return_value=(False, False))),
+            patch.object(registrator_module, "exchange_code", side_effect=fake_exchange_code),
+            patch.object(registrator_module, "parse_id_token", return_value={
+                "account_id": "acc-reauth",
+                "user_id": "user-reauth",
+                "plan_type": "free",
+                "email": "profile@example.com",
+            }),
+        ):
+            result = await Registrator(None).oauth_from_profile_with_phone_attempts(
+                proxy="http://127.0.0.1:7890",
+                profile_path="D:/profiles/worker_reg_1",
+                rent_next_phone=rent_next_phone,
+                max_phone_attempts=1,
+                redirect_uri="http://localhost:1455/auth/callback",
+                headless=True,
+                email="profile@example.com",
+                password="password-123",
+            )
+
+        self.assertEqual(recovery_urls, ["https://auth.openai.com/choose-an-account", "https://auth.openai.com/log-in/password"])
+        self.assertEqual(result["refresh_token"], "reauth-refresh")
+
     async def test_oauth_from_profile_reuses_profile_and_exchanges_callback_code(self):
         from app.services import registrator as registrator_module
 

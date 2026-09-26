@@ -9,11 +9,11 @@ from app.services.clash_verge import choose_next_proxy_name, ordered_real_proxy_
 
 
 def test_rotate_clash_proxy_for_round_passes_instance_params(monkeypatch):
-    """Codex OAuth 独立 Mihomo 实例：controller/selector/proxy 参数应透传到 sync。"""
+    """Codex OAuth 独立 Mihomo 实例：controller/selector/proxy/region 参数应透传到 sync。"""
     captured = {}
 
-    def fake_sync(log=None, controller_url="", selector_name="", proxy=""):
-        captured.update(controller_url=controller_url, selector_name=selector_name, proxy=proxy)
+    def fake_sync(log=None, controller_url="", selector_name="", proxy="", region_keywords=None):
+        captured.update(controller_url=controller_url, selector_name=selector_name, proxy=proxy, region_keywords=region_keywords)
         return {"ok": True, "after": "node-x", "ip": "1.2.3.4"}
 
     monkeypatch.setattr(clash_verge, "rotate_clash_proxy_sync", fake_sync)
@@ -22,12 +22,14 @@ def test_rotate_clash_proxy_for_round_passes_instance_params(monkeypatch):
         controller_url="http://127.0.0.1:9098",
         selector_name="良心云",
         proxy="http://127.0.0.1:7891",
+        region_keywords="🇺🇸,美国,US",
     ))
 
     assert result["ok"] is True
     assert captured["controller_url"] == "http://127.0.0.1:9098"
     assert captured["selector_name"] == "良心云"
     assert captured["proxy"] == "http://127.0.0.1:7891"
+    assert captured["region_keywords"] == "🇺🇸,美国,US"
 
 
 def test_choose_next_proxy_name_rotates_to_next_real_node():

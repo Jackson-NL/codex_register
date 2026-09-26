@@ -175,7 +175,7 @@ def test_registration_placeholder_phone_avoids_legacy_and_existing_values():
 # ------------------------------------------------------------------
 
 def _patch_rotate(monkeypatch, calls):
-    async def fake_rotate(*, log=None, proxy="", controller_url="", selector_name=""):
+    async def fake_rotate(*, log=None, proxy="", controller_url="", selector_name="", **kwargs):
         calls.append(proxy)
         return {"ok": True, "before": "nodeA", "after": "nodeB", "ip": "203.0.113.7"}
 
@@ -197,7 +197,7 @@ def test_guarded_registration_logs_pre_run_rotation(monkeypatch):
     monkeypatch.setattr(registration_service, "SessionLocal", Session)
     monkeypatch.setattr(registration_service.settings, "clash_rotate_enabled", True)
 
-    async def fake_rotate(*, log=None, proxy="", controller_url="", selector_name=""):
+    async def fake_rotate(*, log=None, proxy="", controller_url="", selector_name="", **kwargs):
         if log:
             log("[proxy] 测试轮换日志")
         return {"ok": True, "before": "A", "after": "B", "ip": "203.0.113.9"}
@@ -252,7 +252,7 @@ def test_quiesced_rotation_lock_rechecks_active_after_waiting(monkeypatch):
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def slow_rotate(*, log=None, proxy="", controller_url="", selector_name=""):
+    async def slow_rotate(*, log=None, proxy="", controller_url="", selector_name="", **kwargs):
         calls.append(proxy)
         started.set()
         await release.wait()
@@ -297,7 +297,7 @@ def test_quiesced_rotation_skips_gmail_batch_and_disabled_setting(monkeypatch):
 
 
 def test_quiesced_rotation_failure_is_non_fatal(monkeypatch):
-    async def failing_rotate(*, log=None, proxy="", controller_url="", selector_name=""):
+    async def failing_rotate(*, log=None, proxy="", controller_url="", selector_name="", **kwargs):
         return {"ok": False, "error": "controller unreachable"}
 
     monkeypatch.setattr("app.services.clash_verge.rotate_clash_proxy_for_round", failing_rotate)

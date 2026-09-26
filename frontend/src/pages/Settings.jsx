@@ -37,7 +37,7 @@ const FIELD_DEFS = {
     { key: "clientName", label: "客户端名称", type: "text", desc: "OAuth 应用的注册名称（只读）", locked: true },
   ],
   sms: [
-    { key: "api_key", label: "API Key", type: "password", desc: "SMSBOWER 平台 API 密钥" },
+    { key: "api_key", label: "单 Key（兜底）", type: "password", desc: "SMSBOWER 单把 API 密钥；Key 池为空时才使用" },
     { key: "base_url", label: "API 地址", type: "text", desc: "handler_api 端点地址" },
     { key: "service", label: "服务代码", type: "text", desc: "接码服务标识（如 dr）" },
     { key: "country", label: "国家代码", type: "number", min: 1, max: 999, desc: "国家数字代码（如 73=巴⻄）" },
@@ -48,6 +48,7 @@ const FIELD_DEFS = {
     { key: "admin_api_key", label: "管理员 API Key", type: "password", desc: "优先使用 x-api-key 认证" },
     { key: "jwt", label: "管理员 JWT", type: "password", desc: "未配置 API Key 时作为备用认证" },
     { key: "timeout", label: "请求超时（秒）", type: "number", min: 3, max: 120, desc: "获取分组和上传账号的单次请求超时" },
+    { key: "proxy", label: "出口代理", type: "text", desc: "Sub2API 按出口 IP 地区准入，直连常返回 403 REGION_NOT_SUPPORTED。留空=沿用「默认代理」；填 direct 强制直连（自建/内网部署时用）" },
     { key: "group_ids", label: "默认上传分组 ID", type: "text", desc: "逗号分隔，可填多个分组 ID；账号管理上传时默认使用，也可在弹窗临时修改" },
   ],
   proxy: [
@@ -85,6 +86,20 @@ export default function Settings() {
   const [secretVisible, setSecretVisible] = useState(false);
   const [testingSms, setTestingSms] = useState(false);
   const [smsTestResult, setSmsTestResult] = useState(null);
+  // Key 池：独立于 form（后端按 .env 持久化），留空表示不修改
+  const [keyPoolInput, setKeyPoolInput] = useState("");
+  const [keyStrategy, setKeyStrategy] = useState("");
+  const [poolCleared, setPoolCleared] = useState(false);
+
+  const keyPoolMasks = smsSettings?.smsbower_api_key_masks || [];
+  const keyPoolCount = smsSettings?.smsbower_api_key_count ?? keyPoolMasks.length;
+  const activeStrategy = keyStrategy || smsSettings?.smsbower_key_strategy || "round_robin";
+  const STRATEGY_OPTIONS = [
+    { value: "round_robin", label: "轮询（每租一个号取下一把）" },
+    { value: "random", label: "随机（每租一个号随机取一把）" },
+  ];
+  const poolDirty = !!keyPoolInput.trim() || poolCleared
+    || (!!keyStrategy && keyStrategy !== (smsSettings?.smsbower_key_strategy || "round_robin"));
 
   const defaultVal = useMemo(() => defaultSettings(), []);
   // 服务端返回的整组配置可能为空对象，需与默认值逐组合并，避免 current[group] 为 undefined
@@ -112,6 +127,7 @@ export default function Settings() {
         admin_api_key: smsSettings.sub2api_has_admin_api_key ? "••••••••" : "",
         jwt: smsSettings.sub2api_has_jwt ? "••••••••" : "",
         timeout: smsSettings.sub2api_timeout,
+        proxy: smsSettings.sub2api_proxy ?? merged.sub2api.proxy,
         group_ids: smsSettings.sub2api_group_ids ?? merged.sub2api.group_ids,
       };
     }
@@ -154,12 +170,21 @@ export default function Settings() {
         if (current.sms.api_key && current.sms.api_key !== "••••••••") {
           body.smsbower_api_key = current.sms.api_key;
         }
+        // Key 池：输入内容追加到现有池；点击「清空」后提交空串=清空池
+        if (poolCleared) body.smsbower_api_keys = "";
+        else if (keyPoolInput.trim()) body.smsbower_api_keys_append = keyPoolInput;
+        if (keyStrategy) body.smsbower_key_strategy = keyStrategy;
         await api.settings.put(body);
+        setKeyPoolInput("");
+        setPoolCleared(false);
+        setKeyStrategy("");
+        setSmsTestResult(null);
       } else if (group === "sub2api") {
         const body = {
           sub2api_base_url: current.sub2api.base_url,
           sub2api_timeout: Number(current.sub2api.timeout),
           sub2api_group_ids: String(current.sub2api.group_ids || "").trim(),
+          sub2api_proxy: String(current.sub2api.proxy || "").trim(),
         };
         if (current.sub2api.admin_api_key && current.sub2api.admin_api_key !== "••••••••") {
           body.sub2api_admin_api_key = current.sub2api.admin_api_key;
@@ -188,7 +213,7 @@ export default function Settings() {
   };
 
   const dirty = useMemo(() => {
-    if (!form) return false;
+    if (!form) return poolDirty;
     if (group === "sms") {
       const base = smsSettings ? {
         api_key: smsSettings.smsbower_has_api_key ? "••••••••" : "",
@@ -197,7 +222,7 @@ export default function Settings() {
         country: smsSettings.smsbower_country,
         max_price: smsSettings.smsbower_max_price,
       } : defaultVal.sms;
-      return JSON.stringify(form.sms) !== JSON.stringify(base);
+      return JSON.stringify(form.sms) !== JSON.stringify(base) || poolDirty;
     }
     if (group === "sub2api") {
       const base = smsSettings ? {
@@ -205,12 +230,13 @@ export default function Settings() {
         admin_api_key: smsSettings.sub2api_has_admin_api_key ? "••••••••" : "",
         jwt: smsSettings.sub2api_has_jwt ? "••••••••" : "",
         timeout: smsSettings.sub2api_timeout,
+        proxy: smsSettings.sub2api_proxy ?? "",
         group_ids: smsSettings.sub2api_group_ids ?? "",
       } : defaultVal.sub2api;
       return JSON.stringify(form.sub2api) !== JSON.stringify(base);
     }
     return JSON.stringify(form[group]) !== JSON.stringify(serverSettings?.[group] || defaultVal[group]);
-  }, [form, serverSettings, smsSettings, group, defaultVal]);
+  }, [form, serverSettings, smsSettings, group, defaultVal, poolDirty]);
 
   const testSmsbower = async () => {
     setTestingSms(true);
@@ -218,8 +244,13 @@ export default function Settings() {
     try {
       const res = await api.settings.testSmsbower();
       setSmsTestResult(res.ok
-        ? { type: "success", text: `连接成功 · 余额 $${res.balance}` }
-        : { type: "error", text: `连接失败: ${res.error}` });
+        ? {
+          type: "success",
+          text: `连接成功 · ${res.key_count || 1} 把 Key 可用 ${res.usable_count ?? 1} 把 · 余额合计 $${res.balance}`,
+          results: res.results || [],
+        }
+        : { type: "error", text: `连接失败: ${res.error}`, results: res.results || [] });
+      reloadRuntimeSettings();
     } catch (e) {
       setSmsTestResult({ type: "error", text: `测试失败: ${e.message}` });
     } finally {
@@ -326,16 +357,88 @@ export default function Settings() {
                 </div>
               )}
               {group === "sms" && (
-                <div className="flex items-center gap-3 rounded-md bg-slate-50 px-3 py-2">
-                  <Button variant="secondary" size="sm" icon={<RefreshCw size={12} />} onClick={testSmsbower} disabled={testingSms}>
-                    {testingSms ? "测试中…" : "测试连接"}
-                  </Button>
-                  {smsTestResult && (
-                    <span className={`text-xs ${smsTestResult.type === "success" ? "text-emerald-600" : "text-red-600"}`}>
-                      {smsTestResult.text}
+                <div className="space-y-3 rounded-md border border-slate-200 p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="flex items-center gap-1.5 text-xs font-medium text-slate-600">
+                      <ShieldCheck size={14} />API Key 池（多 Key 轮询）
                     </span>
+                    <Badge color={keyPoolCount > 0 ? "success" : "neutral"} dot>
+                      {keyPoolCount > 0 ? `${keyPoolCount} 把可用` : "未配置"}
+                    </Badge>
+                  </div>
+
+                  {keyPoolCount > 0 && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {keyPoolMasks.map((item, index) => (
+                        <span key={`${item}-${index}`} className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-500">
+                          #{index + 1} {item}
+                        </span>
+                      ))}
+                    </div>
                   )}
-                  {smsTestResult?.type === "success" && <Badge color="success" dot>已连接</Badge>}
+
+                  <div className="flex items-start justify-between gap-6">
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[13px] font-medium text-slate-700">轮询策略</div>
+                      <div className="mt-0.5 text-xs leading-relaxed text-slate-400">
+                        每新建一个订单（取号 / 租 Gmail）就从池里取一把 Key，所以同一个任务连续租号也会分摊到多把 Key。订单的查码、取消会精确复用创建它的那把 Key（SMSBower 的订单归属其创建 Key，换 Key 会查不到订单）。
+                      </div>
+                    </div>
+                    <div className="w-56 shrink-0">
+                      <Select options={STRATEGY_OPTIONS} value={activeStrategy} onChange={setKeyStrategy} />
+                    </div>
+                  </div>
+
+                  <div className="flex items-start justify-between gap-6">
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[13px] font-medium text-slate-700">追加 Key</div>
+                      <div className="mt-0.5 text-xs leading-relaxed text-slate-400">
+                        每行一把，也支持逗号、分号分隔。保存后追加到现有 Key 池，重复 Key 会自动去重；留空保存=保持不变。
+                      </div>
+                      {poolCleared && (
+                        <div className="mt-1 text-[11px] text-red-600">已标记清空：保存后 Key 池将被清空</div>
+                      )}
+                    </div>
+                    <div className="w-56 shrink-0 space-y-2">
+                      <textarea
+                        className="input h-24 resize-y font-mono text-[12px]"
+                        placeholder={keyPoolCount > 0 ? "已配置 Key 池（留空不修改）" : "每行一把 Key"}
+                        value={keyPoolInput}
+                        onChange={(e) => { setKeyPoolInput(e.target.value); if (e.target.value.trim()) setPoolCleared(false); }}
+                      />
+                      <button
+                        className="text-[11px] text-slate-400 hover:text-red-600"
+                        onClick={() => { setKeyPoolInput(""); setPoolCleared(true); }}
+                      >
+                        清空 Key 池
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-3 border-t border-slate-100 pt-3">
+                    <Button variant="secondary" size="sm" icon={<RefreshCw size={12} />} onClick={testSmsbower} disabled={testingSms}>
+                      {testingSms ? "测试中…" : "测试全部 Key"}
+                    </Button>
+                    {smsTestResult && (
+                      <span className={`text-xs ${smsTestResult.type === "success" ? "text-emerald-600" : "text-red-600"}`}>
+                        {smsTestResult.text}
+                      </span>
+                    )}
+                    {smsTestResult?.type === "success" && <Badge color="success" dot>已连接</Badge>}
+                  </div>
+
+                  {smsTestResult?.results?.length > 0 && (
+                    <div className="space-y-1 rounded bg-slate-50 px-3 py-2">
+                      {smsTestResult.results.map((item) => (
+                        <div key={item.slot} className="flex items-center gap-2 text-[11px]">
+                          <span className="font-mono text-slate-500">#{item.slot} {item.mask}</span>
+                          {item.ok
+                            ? <span className="text-emerald-600">余额 ${item.balance}</span>
+                            : <span className="text-red-600">{item.error || "不可用"}</span>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
             </div>

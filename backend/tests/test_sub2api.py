@@ -7,27 +7,75 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
 from app.models import Account, AccountSub2APIUpload
+from app.services import sub2api as sub2api_service
 from app.services.sub2api import (
     Sub2APIClient,
     Sub2APIError,
     build_sub2api_account_payload,
     classify_sub2api_upload_status,
+    describe_sub2api_http_error,
     filter_sub2api_upload_accounts,
+    resolve_sub2api_proxy,
+    sub2api_client_from_settings,
     upsert_account_sub2api_upload,
     write_sub2api_upload_status_rows,
 )
 
 
 class FakeResponse:
-    def __init__(self, status_code, payload):
+    def __init__(self, status_code, payload=None, text=None):
         self.status_code = status_code
         self._payload = payload
+        self.text = text if text is not None else ""
 
     def json(self):
         return self._payload
 
 
 class Sub2APIClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_test_account_consumes_success_sse(self):
+        calls = []
+
+        async def request(method, url, headers, json=None):
+            calls.append((method, url, json))
+            return FakeResponse(
+                200,
+                text='data: {"type":"test_start","model":"gpt-5.6-luna"}\n\n'
+                'data: {"type":"test_complete","success":true}\n\n',
+            )
+
+        client = Sub2APIClient(base_url="https://sub2api.example", jwt="jwt", request=request)
+        result = await client.test_account("17")
+
+        self.assertTrue(result["success"])
+        self.assertFalse(result["rate_limited"])
+        self.assertEqual(calls[0][0], "POST")
+        self.assertTrue(calls[0][1].endswith("/api/v1/admin/accounts/17/test"))
+        self.assertEqual(calls[0][2], {"model_id": "gpt-5.6-luna", "prompt": "hi", "mode": ""})
+
+    async def test_test_account_treats_429_sse_error_as_nonfatal_rate_limit(self):
+        async def request(method, url, headers, json=None):
+            return FakeResponse(
+                200,
+                text='data: {"type":"error","error":"API returned 429: quota exceeded"}\n\n',
+            )
+
+        client = Sub2APIClient(base_url="https://sub2api.example", jwt="jwt", request=request)
+        result = await client.test_account("17")
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["rate_limited"])
+        self.assertIn("429", result["error"])
+
+    async def test_test_account_rejects_admin_auth_failure(self):
+        async def request(method, url, headers, json=None):
+            return FakeResponse(401, text="unauthorized")
+
+        client = Sub2APIClient(base_url="https://sub2api.example", jwt="jwt", request=request)
+        with self.assertRaises(Sub2APIError) as ctx:
+            await client.test_account("17")
+        self.assertTrue(ctx.exception.fatal)
+
     async def test_default_request_reuses_http_client_until_closed(self):
         clients = []
 
@@ -1343,6 +1391,90 @@ class SyncUploadStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(statuses[(1, 42)], "uploaded")
         self.assertEqual(statuses[(1, 108)], "group_mismatch")
         self.assertEqual(result["group_mismatch"], 1)
+
+
+class Sub2APIProxyTests(unittest.IsolatedAsyncioTestCase):
+    def test_resolve_proxy_falls_back_to_default_proxy(self):
+        self.assertEqual(
+            resolve_sub2api_proxy("", default_proxy="http://127.0.0.1:7890"),
+            "http://127.0.0.1:7890",
+        )
+        self.assertEqual(resolve_sub2api_proxy("http://a:1", default_proxy="http://b:2"), "http://a:1")
+
+    def test_resolve_proxy_direct_sentinels_force_direct(self):
+        for value in ("direct", "NONE", " off "):
+            self.assertEqual(resolve_sub2api_proxy(value, default_proxy="http://127.0.0.1:7890"), "", value)
+
+    async def test_client_builds_httpx_client_with_proxy(self):
+        captured = {}
+
+        class FakeAsyncClient:
+            is_closed = False
+
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            async def request(self, *args, **kwargs):
+                return FakeResponse(200, {"data": []})
+
+        original = sub2api_service.httpx.AsyncClient
+        sub2api_service.httpx.AsyncClient = FakeAsyncClient
+        try:
+            client = Sub2APIClient(base_url="https://sub2api.example", admin_api_key="key", proxy="http://127.0.0.1:7890")
+            await client._request("GET", "https://sub2api.example/x", {})
+        finally:
+            sub2api_service.httpx.AsyncClient = original
+        self.assertEqual(captured["proxy"], "http://127.0.0.1:7890")
+
+    def test_factory_uses_settings_proxy_override_then_default(self):
+        original_value = sub2api_service.settings.sub2api_proxy
+        original_default = sub2api_service.settings.default_proxy
+        sub2api_service.settings.sub2api_proxy = ""
+        sub2api_service.settings.default_proxy = "http://127.0.0.1:7890"
+        try:
+            self.assertEqual(sub2api_client_from_settings().proxy, "http://127.0.0.1:7890")
+            sub2api_service.settings.sub2api_proxy = "direct"
+            self.assertEqual(sub2api_client_from_settings().proxy, "")
+            sub2api_service.settings.sub2api_proxy = "http://socks5:1080"
+            self.assertEqual(sub2api_client_from_settings().proxy, "http://socks5:1080")
+        finally:
+            sub2api_service.settings.sub2api_proxy = original_value
+            sub2api_service.settings.default_proxy = original_default
+
+    async def test_region_block_403_becomes_actionable_error(self):
+        body = (
+            '{"error":{"message":"当前地区不支持该服务","type":"access_denied",'
+            '"code":"REGION_NOT_SUPPORTED"}}'
+        )
+
+        async def request(method, url, headers, json=None):
+            return FakeResponse(403, None, text=body)
+
+        client = Sub2APIClient(base_url="https://sub2api.example", admin_api_key="key", request=request)
+        with self.assertRaises(Sub2APIError) as context:
+            await client.list_groups()
+        error = context.exception
+        self.assertEqual(error.status_code, 403)
+        self.assertTrue(error.fatal)
+        self.assertIn("REGION_NOT_SUPPORTED", str(error))
+        self.assertIn("SUB2API_PROXY", str(error))
+        self.assertNotIn("当前地区不支持该服务", str(error))
+
+    def test_cloudflare_block_hint_only_for_html_error_pages(self):
+        message = describe_sub2api_http_error(403, "<html>Attention Required! | Cloudflare</html>")
+        self.assertIn("CDN/WAF", message)
+        self.assertEqual(describe_sub2api_http_error(404, "404 page not found"), "Sub2API 返回 HTTP 404")
+
+    async def test_connect_error_mentions_configured_proxy(self):
+        async def request(method, url, headers, json=None):
+            raise OSError("connection refused")
+
+        client = Sub2APIClient(
+            base_url="https://sub2api.example", admin_api_key="key", request=request, proxy="http://127.0.0.1:7890"
+        )
+        with self.assertRaises(Sub2APIError) as context:
+            await client.list_groups()
+        self.assertIn("http://127.0.0.1:7890", str(context.exception))
 
 
 if __name__ == "__main__":

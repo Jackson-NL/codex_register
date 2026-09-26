@@ -87,6 +87,7 @@ class BatchCoordinator:
 
             # 活跃注册任务 ID 集合
             active_ids: set[int] = set()
+            pool_pause_logged = False
 
             while batch.status == "running":
                 db.refresh(batch)
@@ -124,6 +125,26 @@ class BatchCoordinator:
                     active_ids.discard(rid)
                 if completed:
                     db.commit()
+
+                # 池耗尽即停：没有可用地址时不再提交新任务；没有在跑的任务就直接结束批量。
+                pool_reason = pool_stop_reason(batch)
+                if pool_reason:
+                    if not active_ids:
+                        self._append_log(batch_id, f"[batch:{batch_id}] {pool_reason}，批量自动停止")
+                        batch.status = "canceled"
+                        batch.finished_at = utcnow()
+                        db.commit()
+                        break
+                    if not pool_pause_logged:
+                        pool_pause_logged = True
+                        self._append_log(
+                            batch_id,
+                            f"[batch:{batch_id}] {pool_reason}，暂停提交新任务，"
+                            f"等待进行中的 {len(active_ids)} 个任务结束或地址回收",
+                        )
+                    await asyncio.sleep(settings.batch_poll_interval_seconds)
+                    continue
+                pool_pause_logged = False
 
                 # 补满并发槽位
                 slots = batch.concurrency - len(active_ids)
@@ -346,6 +367,31 @@ def gmail_registration_finishes_order(reg: Registration) -> bool:
     }:
         return False
     return draft.get("gmail_exhausted_after_alias") is True
+
+
+def pool_stop_reason(batch: Batch) -> str:
+    """自定义邮箱池不可用时返回停止原因（空串=可继续提交新任务）。
+
+    只对 cf_temp_email + custom_pool 生效；Gmail 订单模式与邮箱池无关，直接跳过。
+    可用地址为 0 时暂停提交——进行中的任务仍可能回收地址（如提交前失败自动回收），
+    所以真正结束批量前会等 active 任务收尾。
+    """
+    if batch.gmail_mode:
+        return ""
+    from .mail_providers.base import effective_mail_provider_name
+
+    if effective_mail_provider_name() != "cf_temp_email":
+        return ""
+    if (settings.cf_temp_email_address_mode or "").lower() != "custom_pool":
+        return ""
+    from . import mail_pool
+
+    pool = mail_pool.parse_custom_pool(settings.cf_temp_email_custom_pool)
+    if not pool:
+        return "自定义邮箱池为空"
+    if mail_pool.available_count(pool) > 0:
+        return ""
+    return f"自定义邮箱池已耗尽（共 {len(pool)} 个地址，可用 0）"
 
 
 async def _next_gmail_alias(db, log=None) -> tuple[str, str, dict]:

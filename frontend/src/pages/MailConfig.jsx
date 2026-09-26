@@ -21,8 +21,9 @@ const DEFAULT_FORM = {
     custom_pool: "",
     custom_pool_count: 0,
     custom_pool_sample: [],
-    custom_pool_status_counts: { unused: 0, in_use: 0, used: 0, failed: 0 },
+    custom_pool_status_counts: { unused: 0, in_use: 0, used: 0, failed: 0, disabled: 0 },
     custom_pool_items: [],
+    custom_pool_summary: {},
     inbox_address: "",
     inbox_jwt: "",
     has_inbox_jwt: false,
@@ -186,12 +187,13 @@ export default function MailConfig() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [poolEntries, setPoolEntries] = useState([]);
   const [poolImport, setPoolImport] = useState("");
   const [poolImportMode, setPoolImportMode] = useState("append");
   const [poolImportOpen, setPoolImportOpen] = useState(false);
   const [poolImportError, setPoolImportError] = useState("");
-  const [touched, setTouched] = useState({ sitePassword: false, customPool: false, inboxJwt: false, accountsPool: false, graphSecret: false });
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [poolBusy, setPoolBusy] = useState(false);
+  const [touched, setTouched] = useState({ sitePassword: false, inboxJwt: false, accountsPool: false, graphSecret: false });
   const [visible, setVisible] = useState({ sitePassword: false, inboxJwt: false, graphSecret: false });
 
   const load = async () => {
@@ -201,13 +203,12 @@ export default function MailConfig() {
       const normalized = normalizeConfig(data);
       setForm(normalized);
       setServerForm(clone(normalized));
-      setPoolEntries([]);
       setUpdatedAt(data.updated_at || null);
       setLastTest(data.test_status || null);
-      setPoolEntries([]);
       setPoolImport("");
       setPoolImportError("");
-      setTouched({ sitePassword: false, customPool: false, inboxJwt: false, accountsPool: false, graphSecret: false });
+      setSelectedIds([]);
+      setTouched({ sitePassword: false, inboxJwt: false, accountsPool: false, graphSecret: false });
     } catch (error) {
       toast(`邮箱配置加载失败: ${error.message}`, "error");
     } finally {
@@ -220,33 +221,52 @@ export default function MailConfig() {
   const patch = (section, key, value) => {
     setForm((current) => ({ ...current, [section]: { ...current[section], [key]: value } }));
     if (section === "cf_temp_email" && key === "site_password") setTouched((state) => ({ ...state, sitePassword: true }));
-    if (section === "cf_temp_email" && key === "custom_pool") setTouched((state) => ({ ...state, customPool: true }));
     if (section === "cf_temp_email" && key === "inbox_jwt") setTouched((state) => ({ ...state, inboxJwt: true }));
     if (section === "outlook" && key === "accounts_pool") setTouched((state) => ({ ...state, accountsPool: true }));
     if (section === "outlook" && key === "graph_client_secret") setTouched((state) => ({ ...state, graphSecret: true }));
   };
 
-  const updatePool = (entries) => {
-    const unique = [...new Set(entries.map((entry) => String(entry).trim().toLowerCase()).filter(Boolean))];
-    setPoolEntries(unique);
-    patch("cf_temp_email", "custom_pool", unique.join("\n"));
+  const applyConfigResponse = (data) => {
+    const normalized = normalizeConfig(data);
+    setForm(normalized);
+    setServerForm(clone(normalized));
+    setUpdatedAt(data.updated_at || null);
+    setLastTest(data.test_status || null);
   };
 
-  const importPool = () => {
+  const importPool = async () => {
     const { valid, invalid } = parsePoolText(poolImport);
     if (!valid.length) {
       setPoolImportError(invalid.length ? `没有可导入的有效邮箱（${invalid.length} 条格式错误）` : "请先粘贴至少一个邮箱地址");
       return;
     }
-    if (poolImportMode === "append" && !poolEntries.length && form.cf_temp_email.custom_pool_count > 0) {
-      setPoolImportError("已保存地址明文不可回显；请导入完整地址后选择“替换全部地址”，避免覆盖旧地址");
-      return;
+    const savedCount = form.cf_temp_email.custom_pool_count || 0;
+    const append = poolImportMode === "append" && savedCount > 0;
+    if (!append && savedCount > 0) {
+      if (!window.confirm(`替换全部会从池中移除当前 ${savedCount} 个地址（历史状态保留），确认替换？`)) return;
     }
-    const next = poolImportMode === "replace" ? valid : [...poolEntries, ...valid];
-    updatePool(next);
-    setPoolImportError(invalid.length ? `已导入 ${valid.length} 条，忽略 ${invalid.length} 条格式错误` : `已导入 ${valid.length} 条地址`);
-    setPoolImport("");
-    if (!invalid.length) setPoolImportOpen(false);
+    setPoolBusy(true);
+    setPoolImportError("");
+    try {
+      // 导入即保存：追加模式由后端与已保存池合并（明文不回显前端）。
+      const data = await api.mailConfig.save({
+        cf_temp_email: buildCfPayload({
+          custom_pool: valid.join("\n"),
+          custom_pool_append: append || undefined,
+        }),
+      });
+      applyConfigResponse(data);
+      setPoolImport("");
+      setPoolImportOpen(false);
+      toast(
+        `已导入 ${valid.length} 条地址${invalid.length ? `，忽略 ${invalid.length} 条格式错误` : ""}`,
+        invalid.length ? "warning" : "success"
+      );
+    } catch (error) {
+      setPoolImportError(`导入失败: ${error.message}`);
+    } finally {
+      setPoolBusy(false);
+    }
   };
 
   const errors = useMemo(() => fieldErrors(form), [form]);
@@ -254,39 +274,107 @@ export default function MailConfig() {
   const cfConfigured = form.cf_temp_email.has_site_password;
   const graphConfigured = form.outlook.has_graph_client_secret;
   const poolStatus = form.cf_temp_email.custom_pool_status_counts || {};
+  const poolSummary = form.cf_temp_email.custom_pool_summary || {};
+  const savedPoolItems = form.cf_temp_email.custom_pool_items || [];
   const poolStatusMeta = {
     unused: { label: "未使用", color: "success" },
     in_use: { label: "使用中", color: "info" },
     used: { label: "已使用", color: "neutral" },
     failed: { label: "失败", color: "danger" },
+    disabled: { label: "已停用", color: "neutral" },
+  };
+  const poolReasonMeta = {
+    pre_submit: { label: "可回收", color: "warning" },
+    unknown: { label: "待确认", color: "neutral" },
+    crash_recovered: { label: "崩溃恢复", color: "neutral" },
+    lease_expired: { label: "租约超时", color: "neutral" },
+    manual: { label: "人工标记", color: "neutral" },
+  };
+
+  const togglePoolSelect = (id) => {
+    setSelectedIds((ids) => (ids.includes(id) ? ids.filter((item) => item !== id) : [...ids, id]));
+  };
+  const toggleSelectAll = () => {
+    setSelectedIds((ids) => (ids.length === savedPoolItems.length ? [] : savedPoolItems.map((item) => item.id)));
+  };
+  const runPoolAction = async (method, payload, label, options = {}) => {
+    if (!payload.ids.length && !options.allowEmpty) return;
+    setPoolBusy(true);
+    try {
+      const result = await api.mailConfig[method](payload);
+      setSelectedIds([]);
+      const skipped = result?.skipped?.length || 0;
+      const detail = skipped ? `，跳过 ${skipped} 个（${result.skipped[0]?.reason || ""}）` : "";
+      toast(`${label}完成：${result?.affected ?? 0} 个${detail}`, skipped ? "warning" : "success");
+      await load();
+    } catch (error) {
+      toast(`${label}失败: ${error.message}`, "error");
+    } finally {
+      setPoolBusy(false);
+    }
+  };
+  const requeueSelected = async () => {
+    if (!selectedIds.length) return;
+    setPoolBusy(true);
+    try {
+      let result = await api.mailConfig.poolRequeue({ ids: selectedIds });
+      if (!result.affected && result.skipped?.length) {
+        const ok = window.confirm(`选中的 ${result.skipped.length} 个地址并非「可证明未消费」，强制回收可能复用半消费邮箱。确认强制回收？`);
+        if (ok) result = await api.mailConfig.poolRequeue({ ids: selectedIds, force: true });
+      }
+      setSelectedIds([]);
+      toast(`回收完成：${result.affected} 个`, result.affected ? "success" : "warning");
+      await load();
+    } catch (error) {
+      toast(`回收失败: ${error.message}`, "error");
+    } finally {
+      setPoolBusy(false);
+    }
+  };
+  const removePoolItems = async (ids) => {
+    if (!ids.length) return;
+    if (!window.confirm(`确认从地址池移除 ${ids.length} 个地址？（仅移除池成员，不影响账号管理中的账号）`)) return;
+    setPoolBusy(true);
+    try {
+      const result = await api.mailConfig.poolRemove({ ids });
+      const skipped = result?.skipped?.length || 0;
+      const detail = skipped ? `，跳过 ${skipped} 个（${result.skipped[0]?.reason || ""}）` : "";
+      toast(`移除完成：${result?.affected ?? 0} 个${detail}`, skipped ? "warning" : "success");
+      setSelectedIds([]);
+      await load();
+    } catch (error) {
+      toast(`移除失败: ${error.message}`, "error");
+    } finally {
+      setPoolBusy(false);
+    }
+  };
+
+  const buildCfPayload = (overrides) => {
+    const cf = { ...form.cf_temp_email };
+    delete cf.has_site_password;
+    // 池成员只经「批量导入 / 移除」专用动作修改，普通保存不携带 custom_pool。
+    delete cf.custom_pool;
+    delete cf.custom_pool_append;
+    delete cf.custom_pool_count;
+    delete cf.custom_pool_sample;
+    delete cf.custom_pool_status_counts;
+    delete cf.custom_pool_items;
+    delete cf.custom_pool_summary;
+    if (!touched.sitePassword || !cf.site_password || cf.site_password === MASK) delete cf.site_password;
+    if (!touched.inboxJwt || !cf.inbox_jwt || cf.inbox_jwt === MASK) delete cf.inbox_jwt;
+    return { ...cf, ...(overrides || {}) };
   };
 
   const buildPayload = () => {
-    const body = {
-      provider: form.provider,
-      cf_temp_email: { ...form.cf_temp_email },
-      outlook: { ...form.outlook },
-    };
-    delete body.cf_temp_email.has_site_password;
-    delete body.cf_temp_email.custom_pool_count;
-    delete body.cf_temp_email.custom_pool_sample;
-    delete body.cf_temp_email.custom_pool_status_counts;
-    delete body.cf_temp_email.custom_pool_items;
-    delete body.outlook.accounts_count;
-    delete body.outlook.accounts_sample;
-    delete body.outlook.has_graph_client_secret;
-    if (!touched.sitePassword || !body.cf_temp_email.site_password || body.cf_temp_email.site_password === MASK) {
-      delete body.cf_temp_email.site_password;
+    const outlook = { ...form.outlook };
+    delete outlook.accounts_count;
+    delete outlook.accounts_sample;
+    delete outlook.has_graph_client_secret;
+    if (!touched.accountsPool) delete outlook.accounts_pool;
+    if (!touched.graphSecret || !outlook.graph_client_secret || outlook.graph_client_secret === MASK) {
+      delete outlook.graph_client_secret;
     }
-    if (!touched.customPool) delete body.cf_temp_email.custom_pool;
-    if (!touched.inboxJwt || !body.cf_temp_email.inbox_jwt || body.cf_temp_email.inbox_jwt === MASK) {
-      delete body.cf_temp_email.inbox_jwt;
-    }
-    if (!touched.accountsPool) delete body.outlook.accounts_pool;
-    if (!touched.graphSecret || !body.outlook.graph_client_secret || body.outlook.graph_client_secret === MASK) {
-      delete body.outlook.graph_client_secret;
-    }
-    return body;
+    return { provider: form.provider, cf_temp_email: buildCfPayload(), outlook };
   };
 
   const validate = () => {
@@ -307,7 +395,8 @@ export default function MailConfig() {
       setServerForm(clone(normalized));
       setUpdatedAt(data.updated_at || null);
       setLastTest(data.test_status || lastTest);
-      setTouched({ sitePassword: false, customPool: false, inboxJwt: false, accountsPool: false, graphSecret: false });
+      setTouched({ sitePassword: false, inboxJwt: false, accountsPool: false, graphSecret: false });
+      setSelectedIds([]);
       toast("邮箱配置已保存", "success");
     } catch (error) {
       toast(`保存失败: ${error.message}`, "error");
@@ -335,8 +424,8 @@ export default function MailConfig() {
   const reset = () => {
     if (!serverForm) return;
     setForm(clone(serverForm));
-    setPoolEntries([]);
-    setTouched({ sitePassword: false, customPool: false, inboxJwt: false, accountsPool: false, graphSecret: false });
+    setSelectedIds([]);
+    setTouched({ sitePassword: false, inboxJwt: false, accountsPool: false, graphSecret: false });
     toast("已撤销未保存修改", "info");
   };
 
@@ -434,27 +523,73 @@ export default function MailConfig() {
                     <div className="mt-1 text-[11px] text-slate-400">注册时从地址池取号，所有地址应转发到下方固定收件箱。</div>
                   </div>
                   <div className="flex items-center gap-1.5">
-                    <Badge color={form.cf_temp_email.custom_pool_count ? "success" : "warning"}>{poolEntries.length || form.cf_temp_email.custom_pool_count} 个地址</Badge>
-                    {poolEntries.length > 0 && <Badge color="warning">待保存</Badge>}
+                    <Badge color={form.cf_temp_email.custom_pool_count ? "success" : "warning"}>{form.cf_temp_email.custom_pool_count} 个地址</Badge>
                   </div>
                 </div>
-                {!poolEntries.length && form.cf_temp_email.custom_pool_count > 0 && <div className="flex flex-wrap gap-1.5">{Object.entries(poolStatusMeta).map(([key, meta]) => <Badge key={key} color={meta.color}>{meta.label} {poolStatus[key] || 0}</Badge>)}</div>}
+                {form.cf_temp_email.custom_pool_count > 0 && (
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap gap-1.5">
+                      <Badge color={(poolSummary.unused ?? poolStatus.unused ?? 0) > 0 ? "success" : "danger"}>可用 {poolSummary.unused ?? poolStatus.unused ?? 0}</Badge>
+                      <Badge color="info">使用中 {poolSummary.in_use ?? poolStatus.in_use ?? 0}</Badge>
+                      <Badge color="neutral">已使用 {poolSummary.used ?? poolStatus.used ?? 0}（完整 {poolSummary.used_full ?? 0} / 仅AT {poolSummary.used_at_only ?? 0}）</Badge>
+                      <Badge color="danger">失败 {poolSummary.failed ?? poolStatus.failed ?? 0}{(poolSummary.recyclable_failed ?? 0) > 0 ? `（可回收 ${poolSummary.recyclable_failed}）` : ""}</Badge>
+                      {(poolSummary.disabled ?? poolStatus.disabled ?? 0) > 0 && <Badge color="neutral">已停用 {poolSummary.disabled ?? poolStatus.disabled}</Badge>}
+                    </div>
+                    {poolSummary.low_water && (
+                      <div className="rounded-md bg-red-50 px-3 py-2 text-[11px] text-red-700">
+                        低水位告警：可用地址仅 {poolSummary.unused ?? 0} 个（阈值 {poolSummary.low_water_threshold ?? 0}），请及时补充地址
+                      </div>
+                    )}
+                  </div>
+                )}
+                {savedPoolItems.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-2 rounded-md border border-slate-200 bg-white px-3 py-2">
+                    <label className="flex items-center gap-1.5 text-xs text-slate-600">
+                      <input type="checkbox" checked={selectedIds.length > 0 && selectedIds.length === savedPoolItems.length} onChange={toggleSelectAll} />
+                      全选
+                    </label>
+                    <span className="text-xs text-slate-400">已选 {selectedIds.length}</span>
+                    <div className="ml-auto flex flex-wrap items-center gap-1.5">
+                      <Button variant="secondary" size="sm" disabled={!selectedIds.length || poolBusy} onClick={requeueSelected}>回收</Button>
+                      <Button variant="secondary" size="sm" disabled={!selectedIds.length || poolBusy} onClick={() => runPoolAction("poolRelease", { ids: selectedIds, outcome: "unused" }, "释放")}>释放</Button>
+                      <Button variant="secondary" size="sm" disabled={!selectedIds.length || poolBusy} onClick={() => runPoolAction("poolDisable", { ids: selectedIds }, "停用")}>停用</Button>
+                      <Button variant="secondary" size="sm" disabled={!selectedIds.length || poolBusy} onClick={() => runPoolAction("poolEnable", { ids: selectedIds }, "启用")}>启用</Button>
+                      <Button variant="secondary" size="sm" loading={poolBusy} onClick={() => runPoolAction("poolVerify", { ids: selectedIds }, "刷新凭据", { allowEmpty: true })}>刷新凭据</Button>
+                      <Button variant="dangerSoft" size="sm" disabled={!selectedIds.length || poolBusy} onClick={() => removePoolItems(selectedIds)}>移除</Button>
+                    </div>
+                  </div>
+                )}
                 <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-slate-200 bg-white px-3 py-2">
                   <div className="flex items-center gap-2 text-xs text-slate-600"><LockKeyhole size={14} className="text-slate-400" />已保存地址仅返回脱敏样例，避免凭证泄露</div>
                   <Button variant="secondary" size="sm" icon={<Upload size={13} />} onClick={() => { setPoolImportOpen(true); setPoolImportError(""); }}>批量导入</Button>
                 </div>
                 <div className="overflow-hidden rounded-md border border-slate-200 bg-white">
                   <div className="grid grid-cols-[1fr_auto] items-center border-b border-slate-100 bg-slate-50 px-3 py-2 text-[11px] font-medium text-slate-500"><span>邮箱地址</span><span>状态</span></div>
-                  {poolEntries.length > 0 ? poolEntries.map((entry) => (
-                    <div key={entry} className="flex items-center justify-between gap-3 border-b border-slate-100 px-3 py-2 last:border-0">
-                      <span className="truncate font-mono text-xs text-slate-700">{entry}</span>
-                      <div className="flex items-center gap-2"><Badge color="warning">待保存</Badge><button type="button" title="移除地址" className="text-slate-400 hover:text-red-600" onClick={() => updatePool(poolEntries.filter((item) => item !== entry))}><Trash2 size={14} /></button></div>
+                  {savedPoolItems.length > 0 ? savedPoolItems.map((item) => (
+                    <div key={item.id} className="flex items-center justify-between gap-3 border-b border-slate-100 px-3 py-2 last:border-0">
+                      <label className="flex min-w-0 items-center gap-2">
+                        <input type="checkbox" checked={selectedIds.includes(item.id)} onChange={() => togglePoolSelect(item.id)} />
+                        <span className="truncate font-mono text-xs text-slate-600">{item.address}</span>
+                      </label>
+                      <div className="flex shrink-0 items-center gap-1.5">
+                        {item.status === "used" && (
+                          <Badge color={item.has_refresh_token ? "success" : "warning"}>{item.has_refresh_token ? "完整" : "仅AT"}</Badge>
+                        )}
+                        {item.status === "failed" && item.reason_code && (
+                          <span title={item.last_error || ""}>
+                            <Badge color={poolReasonMeta[item.reason_code]?.color || "neutral"}>{poolReasonMeta[item.reason_code]?.label || item.reason_code}</Badge>
+                          </span>
+                        )}
+                        {item.status === "in_use" && item.lease_expires_at && (
+                          <span className="text-[11px] text-slate-400">租约至 {fmtTime(item.lease_expires_at).slice(11, 16)}</span>
+                        )}
+                        <Badge color={poolStatusMeta[item.status]?.color || "neutral"} dot>{poolStatusMeta[item.status]?.label || item.status}</Badge>
+                        <button type="button" title="从地址池移除" className="text-slate-400 hover:text-red-600" onClick={() => removePoolItems([item.id])}><Trash2 size={14} /></button>
+                      </div>
                     </div>
-                  )) : form.cf_temp_email.custom_pool_items?.length > 0 ? form.cf_temp_email.custom_pool_items.map((item) => (
-                    <div key={item.id} className="flex items-center justify-between gap-3 border-b border-slate-100 px-3 py-2 last:border-0"><span className="font-mono text-xs text-slate-600">{item.address}</span><Badge color={poolStatusMeta[item.status]?.color || "neutral"} dot>{poolStatusMeta[item.status]?.label || item.status}</Badge></div>
                   )) : <div className="px-3 py-6 text-center text-xs text-slate-400">地址池为空，请批量导入邮箱地址</div>}
                 </div>
-                {poolEntries.length === 0 && form.cf_temp_email.custom_pool_count > 0 && <div className="text-[11px] text-slate-400">地址以脱敏形式展示；如需修改池，请导入完整地址后选择“替换全部”。</div>}
+                {form.cf_temp_email.custom_pool_count > 0 && <div className="text-[11px] text-slate-400">地址以脱敏形式展示；导入立即保存生效（追加不清空旧地址）。</div>}
                 {errors.custom_pool && <span className="block text-[11px] text-red-600">{errors.custom_pool}</span>}
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <Input label="固定收件 CF 邮箱" value={form.cf_temp_email.inbox_address} error={errors.inbox_address} placeholder="例如 jackson@708651.xyz" onChange={(e) => patch("cf_temp_email", "inbox_address", e.target.value)} />
@@ -552,13 +687,16 @@ export default function MailConfig() {
             </div>
             <div className="flex-1 space-y-4 overflow-y-auto p-5">
               <div className="grid grid-cols-2 gap-2 rounded-md bg-slate-100 p-1">
-                {[{ value: "append", label: "追加到待保存列表" }, { value: "replace", label: "替换全部地址" }].map((option) => <button key={option.value} type="button" onClick={() => setPoolImportMode(option.value)} className={`rounded px-2 py-1.5 text-xs font-medium ${poolImportMode === option.value ? "bg-white text-blue-700 shadow-sm" : "text-slate-500"}`}>{option.label}</button>)}
+                {[{ value: "append", label: "追加（保留旧地址）" }, { value: "replace", label: "替换全部地址" }].map((option) => <button key={option.value} type="button" onClick={() => setPoolImportMode(option.value)} className={`rounded px-2 py-1.5 text-xs font-medium ${poolImportMode === option.value ? "bg-white text-blue-700 shadow-sm" : "text-slate-500"}`}>{option.label}</button>)}
               </div>
+              {poolImportMode === "append" && (form.cf_temp_email.custom_pool_count || 0) > 0 && (
+                <div className="rounded-md bg-blue-50 px-3 py-2 text-xs text-blue-700">已保存 {form.cf_temp_email.custom_pool_count} 个地址；导入后直接追加到池尾并立即生效，旧地址保持不变。</div>
+              )}
               <textarea autoFocus value={poolImport} onChange={(event) => { setPoolImport(event.target.value); setPoolImportError(""); }} className="input min-h-56 resize-y font-mono text-xs" placeholder="name@example.com\nsecond@example.com" />
               {poolImportError && <div className={`rounded-md px-3 py-2 text-xs ${poolImportError.includes("忽略") ? "bg-amber-50 text-amber-700" : "bg-red-50 text-red-700"}`}>{poolImportError}</div>}
-              <div className="rounded-md border border-slate-200 bg-slate-50 p-3 text-xs text-slate-500"><div className="mb-2 flex items-center gap-2 font-medium text-slate-700"><ListChecks size={14} />导入规则</div><div>• 自动去重并统一转为小写</div><div>• 无效格式不会进入地址池</div><div>• 替换全部会覆盖当前待保存列表</div></div>
+              <div className="rounded-md border border-slate-200 bg-slate-50 p-3 text-xs text-slate-500"><div className="mb-2 flex items-center gap-2 font-medium text-slate-700"><ListChecks size={14} />导入规则</div><div>• 导入立即保存生效，无需再点保存</div><div>• 自动去重并统一转为小写</div><div>• 无效格式不会进入地址池</div><div>• 追加不会覆盖已保存地址，重复地址自动忽略</div><div>• 替换全部会从池中移除当前所有地址</div></div>
             </div>
-            <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-5 py-4"><Button variant="secondary" onClick={() => setPoolImportOpen(false)}>取消</Button><Button icon={<Upload size={14} />} onClick={importPool}>导入地址</Button></div>
+            <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-5 py-4"><Button variant="secondary" onClick={() => setPoolImportOpen(false)}>取消</Button><Button icon={<Upload size={14} />} loading={poolBusy} onClick={importPool}>导入并保存</Button></div>
           </aside>
         </div>
       )}

@@ -1024,6 +1024,7 @@ async def _run_codex_oauth_job(job_id: str, payload: CodexOAuthJobBody) -> None:
                         controller_url=job.get("proxy_rotation_controller_url") or "",
                         selector_name=job.get("proxy_rotation_selector_name") or "",
                         proxy=job.get("proxy") or settings.default_proxy,
+                        region_keywords=settings.oauth_clash_allowed_region_keywords or settings.clash_allowed_region_keywords,
                         log=lambda m: emit_log(m, flush=True),
                     ),
                     timeout=max(5.0, float(settings.oauth_clash_rotate_timeout_seconds or 30.0)),

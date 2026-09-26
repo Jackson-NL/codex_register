@@ -232,5 +232,11 @@ export const api = {
     get: () => GET("/mail-config"),
     save: (body) => POST("/mail-config", body),
     test: (body) => POST("/mail-config/test", body),
+    poolRequeue: (body) => POST("/mail-config/pool/requeue", body),
+    poolRelease: (body) => POST("/mail-config/pool/release", body),
+    poolDisable: (body) => POST("/mail-config/pool/disable", body),
+    poolEnable: (body) => POST("/mail-config/pool/enable", body),
+    poolVerify: (body) => POST("/mail-config/pool/verify", body),
+    poolRemove: (body) => POST("/mail-config/pool/remove", body),
   },
 };

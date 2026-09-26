@@ -39,12 +39,22 @@ async def lifespan(app: FastAPI):
             watchdog.start()
         except Exception:
             watchdog = None
+    reconciler = None
+    try:
+        from .services.pool_reconciler import PoolReconciler
+
+        reconciler = PoolReconciler()
+        reconciler.start()
+    except Exception:
+        reconciler = None
     app.state.registration_service = service
     try:
         yield
     finally:
         if watchdog:
             await watchdog.stop()
+        if reconciler:
+            await reconciler.stop()
         await stop_oauth_log_writer()
 
 

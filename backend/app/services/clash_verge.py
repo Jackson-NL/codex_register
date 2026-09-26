@@ -79,9 +79,23 @@ def _max_delay_ms() -> int:
         return 0
 
 
+def _parse_region_keywords(raw: str | list[str] | None) -> list[str]:
+    if raw is None:
+        raw = str(getattr(settings, "clash_allowed_region_keywords", "") or "").strip()
+    if isinstance(raw, list):
+        return [str(k).strip().lower() for k in raw if str(k).strip()]
+    return [k.strip().lower() for k in str(raw or "").split(",") if k.strip()]
+
+
 def _region_keywords() -> list[str]:
-    raw = str(getattr(settings, "clash_allowed_region_keywords", "") or "").strip()
-    return [k.strip().lower() for k in raw.split(",") if k.strip()]
+    return _parse_region_keywords(None)
+
+
+def _oauth_region_keywords() -> list[str]:
+    raw = str(getattr(settings, "oauth_clash_allowed_region_keywords", "") or "").strip()
+    if not raw:
+        return _region_keywords()
+    return _parse_region_keywords(raw)
 
 
 def _region_allowed(name: str, keywords: list[str]) -> bool:
@@ -186,7 +200,7 @@ def _close_connections(base: str, headers: dict[str, str]) -> None:
         pass
 
 
-def rotate_clash_proxy_sync(log=None, controller_url: str = "", selector_name: str = "", proxy: str = "") -> dict:
+def rotate_clash_proxy_sync(log=None, controller_url: str = "", selector_name: str = "", proxy: str = "", region_keywords: str | list[str] | None = None) -> dict:
     """同步执行一次节点切换；只有代理连通且出口 IP 已变化才视为成功。
 
     log: 可选回调，每一步写入 batch 日志（前端轮询可见）；用于诊断 Clash 控制器
@@ -194,6 +208,8 @@ def rotate_clash_proxy_sync(log=None, controller_url: str = "", selector_name: s
 
     controller_url/selector_name/proxy: 指定要操作的 Mihomo 实例（默认取 settings.clash_*），
     注册工作台与 Codex OAuth 各自使用独立实例时传入各自的控制器/代理。
+    region_keywords: 本次轮换的地区过滤（逗号分隔字符串或列表）；None=用全局
+    settings.clash_allowed_region_keywords。OAuth 请传 settings.oauth_clash_allowed_region_keywords。
     """
     log_fn = log or (lambda _msg: None)
 
@@ -238,7 +254,7 @@ def rotate_clash_proxy_sync(log=None, controller_url: str = "", selector_name: s
     before = str(selector.get("now") or "")
     _emit("·", f"当前 selector={selector_name} now={before or '?'} before_ip={before_ip or '?'}")
 
-    region_keywords = _region_keywords()
+    region_keywords = _parse_region_keywords(region_keywords)
     if region_keywords:
         _emit("·", f"地区限制关键词: {','.join(region_keywords)}")
 
@@ -338,16 +354,17 @@ def rotate_clash_proxy_sync(log=None, controller_url: str = "", selector_name: s
     }
 
 
-async def rotate_clash_proxy_for_round(log=None, controller_url: str = "", selector_name: str = "", proxy: str = "") -> dict:
+async def rotate_clash_proxy_for_round(log=None, controller_url: str = "", selector_name: str = "", proxy: str = "", region_keywords: str | list[str] | None = None) -> dict:
     """异步包装：每开新轮次前调用。失败返回 ok=False，不直接打断流程。
 
     controller_url/selector_name/proxy: 指定要操作的 Mihomo 实例（默认 settings.clash_*）。
+    region_keywords: 本次轮换的地区过滤；None=用全局，OAuth 请传 oauth 独立关键词。
     """
     loop = asyncio.get_running_loop()
     try:
         return await loop.run_in_executor(
             None,
-            lambda: rotate_clash_proxy_sync(log=log, controller_url=controller_url, selector_name=selector_name, proxy=proxy),
+            lambda: rotate_clash_proxy_sync(log=log, controller_url=controller_url, selector_name=selector_name, proxy=proxy, region_keywords=region_keywords),
         )
     except Exception as exc:  # noqa: BLE001
         try:

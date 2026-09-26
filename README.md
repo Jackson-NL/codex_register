@@ -56,6 +56,7 @@
    编辑 `.env`，至少填写：
 
    - `SMSBOWER_API_KEY` — SMSBower 接码平台 API Key
+   - `SMSBOWER_API_KEYS` / `SMSBOWER_KEY_STRATEGY` — 可选的多 Key 池（逗号分隔）与轮询策略（`round_robin` 顺序轮询 / `random` 随机）；非空时优先于单 Key，也可直接在「系统设置 → 接码设置」里维护。每新建一个订单（取号 / 租 Gmail）取一把 Key，订单的查码与取消复用创建它的那把 Key
    - `DEFAULT_PROXY` — 本地代理地址（默认 `http://127.0.0.1:7890`）
    - `CF_TEMP_EMAIL_BASE_URL` / `CF_TEMP_EMAIL_DOMAIN` — 已部署的 cf-temp-mail 地址
    - `CF_TEMP_EMAIL_ADDRESS_MODE` — `generated` 自动创建地址，或 `custom_pool` 使用自定义邮箱池

@@ -2361,6 +2361,24 @@ class Registrator:
         mfa_submitted = False
         while not captured_codes and asyncio.get_event_loop().time() < deadline:
             now = asyncio.get_event_loop().time()
+            # A stale profile may first land on choose-account, then navigate
+            # to the password page after the account is selected.  Recover
+            # the login session again at that point instead of repeatedly
+            # clicking Continue while the required password remains empty.
+            current_url = str(getattr(page, "url", "") or "")
+            lowered_url = current_url.lower()
+            if "auth.openai.com/log-in" in lowered_url or "auth.openai.com/login" in lowered_url:
+                await self._recover_oauth_login(
+                    page,
+                    email=email,
+                    password=password,
+                    totp_secret=totp_secret,
+                    timeout_s=min(float(timeout_s), 90.0),
+                )
+                capture(page.url)
+                if captured_codes:
+                    break
+                continue
             if "add-phone" in str(getattr(page, "url", "")):
                 # 已登录账号被要求补手机验证：不自动租号，快速失败并给出可执行路径。
                 raise RegisterError(
@@ -2549,26 +2567,29 @@ class Registrator:
             # Login recovery may require a fresh email OTP before TOTP. Use
             # the fixed Duck inbox and only accept mail newer than the cursor
             # captured before this OAuth attempt.
+            is_mfa_url = "mfa-challenge" in lowered_url
             try:
                 code_input = page.locator(", ".join(CODE_INPUT_SELECTORS)).first
                 code_visible = bool(await code_input.count() and await code_input.is_visible())
             except Exception:
                 code_visible = False
-            if code_visible:
+            if code_visible and not is_mfa_url:
                 try:
                     body = await page.locator("body").inner_text(timeout=1200)
                 except Exception:
                     body = ""
                 signal = f"{lowered_url} {body}".lower()
-                email_verification = "email-verification" in lowered_url or any(
-                    marker in signal for marker in ("check your inbox", "verification code")
-                )
+                # 严格判定：仅 URL 含 email-verification 或正文含 check your inbox 才算邮箱验证码页；
+                # 泛词 verification code 会同时命中 TOTP/MFA 页，已移除避免误判为邮箱
+                email_verification = "email-verification" in lowered_url or "check your inbox" in signal
                 if email_verification:
                     if email_code_submitted:
                         await asyncio.sleep(0.4)
                         continue
-                    if not mail_client or not inbox_jwt:
-                        raise RegisterError("oauth", "OAuth 登录需要邮箱验证码，但未配置固定收件箱")
+                    if not inbox_jwt:
+                        raise RegisterError("oauth", "OAuth 登录需要邮箱验证码，但未配置固定收件箱(CF_TEMP_EMAIL_INBOX_JWT)")
+                    if not mail_client:
+                        raise RegisterError("oauth", "OAuth 登录需要邮箱验证码，但固定收件箱初始化失败(请查看日志 [stage:oauth] 固定收件箱初始化失败)")
                     remaining = max(10.0, deadline - asyncio.get_event_loop().time())
                     try:
                         code = await mail_client.wait_for_code(
@@ -3962,6 +3983,24 @@ class Registrator:
                                 flush=True,
                             )
                             last_progress = now
+                        # A stale profile can land on choose-account first and
+                        # only navigate to the password page after the account
+                        # is selected. Recover that login session here too,
+                        # before the stuck-page guard treats it as a failure.
+                        current_url = str(getattr(page, "url", "") or "")
+                        lowered_url = current_url.lower()
+                        if "auth.openai.com/log-in" in lowered_url or "auth.openai.com/login" in lowered_url:
+                            await self._recover_oauth_login(
+                                page,
+                                email=email,
+                                password=password,
+                                totp_secret=totp_secret,
+                                timeout_s=min(float(timeout_s), 90.0),
+                            )
+                            capture(page.url)
+                            if captured_codes:
+                                break
+                            continue
                         mfa_detected, mfa_submitted = await self._handle_oauth_mfa_challenge(
                             page,
                             totp_secret=totp_secret,
@@ -4327,6 +4366,7 @@ class Registrator:
                                     or settings.clash_selector_name
                                 ),
                                 proxy=proxy or settings.default_proxy,
+                                region_keywords=settings.oauth_clash_allowed_region_keywords or settings.clash_allowed_region_keywords,
                                 log=lambda message: emit_log(message, flush=True),
                             ),
                             timeout=max(5.0, float(settings.oauth_clash_rotate_timeout_seconds or 30.0)),

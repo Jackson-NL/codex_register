@@ -11,6 +11,12 @@ class Settings(BaseSettings):
     profiles_dir: str = str(BASE_DIR / "profiles")
 
     smsbower_api_key: str = ""
+    # 多 Key 池：逗号 / 分号 / 换行分隔；非空时优先于 smsbower_api_key。
+    # 取值粒度为「订单」：新建订单（取号 / 租 Gmail）时按策略领一批 Key，
+    # 同一订单的后续查码 / 改状态强制复用该 Key（SMSBower 订单与 Key 绑定）。
+    smsbower_api_keys: str = ""
+    # round_robin=顺序轮询（默认，任务均匀分摊）；random=每次随机领取
+    smsbower_key_strategy: str = "round_robin"
     smsbower_base_url: str = "https://smsbower.app/stubs/handler_api.php"
     smsbower_service: str = "dr"
     smsbower_country: int = 73
@@ -47,6 +53,9 @@ class Settings(BaseSettings):
     oauth_proxy: str = ""
     oauth_clash_controller_url: str = ""
     oauth_clash_selector_name: str = ""
+    # OAuth 独立地区过滤（逗号分隔，留空=跟随 clash_allowed_region_keywords）。
+    # 例：注册用日本，OAuth 用美国时，这里填 🇺🇸,美国,US
+    oauth_clash_allowed_region_keywords: str = ""
     # OAuth 启动前的 Clash 轮换最多等待多久，避免任务永久停在准备阶段。
     oauth_clash_rotate_timeout_seconds: float = 30.0
     # 长时间运行负载控制：OAuth 日志批量写库，避免每行日志创建线程和 SQLite 写事务。
@@ -77,6 +86,9 @@ class Settings(BaseSettings):
     sub2api_jwt: str = ""
     sub2api_timeout: float = 30
     sub2api_group_ids: str = ""
+    # Sub2API 部署侧按出口 IP 地区做准入（REGION_NOT_SUPPORTED → HTTP 403），
+    # 本机直连会被拒。留空时回退 default_proxy；填 direct/none 强制直连。
+    sub2api_proxy: str = ""
     # 留空时使用 SUB2API_BASE_URL/auth/callback；Sub2API 生成重登链接时使用该远端回调，
     # 因此本地浏览器不需要监听 OAuth callback 端口。
     sub2api_reauth_redirect_uri: str = ""
@@ -110,6 +122,17 @@ class Settings(BaseSettings):
     cf_temp_email_poll_timeout: int = 180
     cf_temp_email_max_retries: int = 3
     cf_temp_email_rate_limit_backoff: int = 10
+
+    # ---------- 自定义邮箱池生命周期（v2） ----------
+    # 分配租约：超过该时长仍未释放的 in_use 视为泄漏，由收敛器保守回收。
+    custom_pool_lease_minutes: int = 60
+    # 后台收敛间隔：清理过期租约、刷新凭据快照、检查低水位。
+    custom_pool_reconcile_interval_seconds: int = 60
+    # 低水位：可用地址数低于 max(绝对值, 总数*比例) 时在 UI 告警。
+    custom_pool_low_water_min: int = 5
+    custom_pool_low_water_ratio: float = 0.1
+    # 同一地址因「可证明未消费」被自动回收的最大次数，超过转 failed 防止死循环。
+    custom_pool_max_recycle: int = 3
 
     # Outlook（第一阶段以账号池 manual_pool 为主，imap/graph 仅预留）
     outlook_enabled: bool = False

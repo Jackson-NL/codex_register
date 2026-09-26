@@ -247,19 +247,34 @@ class GmailSession(Base):
 
 
 class CustomMailbox(Base):
-    """自定义邮箱池地址的持久化使用状态。"""
+    """自定义邮箱池地址的持久化使用状态。
+
+    status 状态机：unused → in_use → used / failed；disabled 为人工停用。
+    - in_use 带租约（lease_owner/lease_expires_at），进程崩溃后由收敛器回收；
+    - failed 带 reason_code：pre_submit（可证明未消费，自动回收）/ unknown（保守）；
+    - used 带凭据快照（account_id/has_refresh_token），区分"完整"与"仅 AT"。
+    """
 
     __tablename__ = "custom_mailboxes"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     address: Mapped[str] = mapped_column(String(256), unique=True, index=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
-    status: Mapped[str] = mapped_column(String(16), default="unused", index=True)  # unused/in_use/used/failed
+    status: Mapped[str] = mapped_column(String(16), default="unused", index=True)  # unused/in_use/used/failed/disabled
     allocated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    # ---------- v2 生命周期字段 ----------
+    reason_code: Mapped[str] = mapped_column(String(32), default="", index=True)
+    lease_owner: Mapped[str] = mapped_column(String(64), default="")
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    recycle_count: Mapped[int] = mapped_column(Integer, default=0)
+    account_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    has_refresh_token: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    credential_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class UiSetting(Base):

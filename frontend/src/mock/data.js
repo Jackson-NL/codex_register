@@ -326,6 +326,7 @@ export function defaultSettings() {
       admin_api_key: "",
       jwt: "",
       timeout: 30,
+      proxy: "",
       group_ids: "",
     },
     retention: {

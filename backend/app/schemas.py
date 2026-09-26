@@ -145,6 +145,8 @@ class Sub2APIReloginCreate(BaseModel):
     only_error: bool = True
     headless: bool = True
     concurrency: int = Field(default=3, ge=1, le=5)
+    fresh_profile: bool = False
+    browser_proxy: str = ""
     timeout_s: int = Field(default=160, ge=10, le=900)
     retry_reauth_url: int = Field(default=2, ge=1, le=3)
     delete_deactivated: bool = False
@@ -288,6 +290,10 @@ class SettingsOut(BaseModel):
     smsbower_max_price: float
     smsbower_base_url: str = ""
     smsbower_has_api_key: bool = False
+    # Key 池状态（只回传脱敏摘要，不返回明文 Key）
+    smsbower_api_key_count: int = 0
+    smsbower_api_key_masks: list[str] = []
+    smsbower_key_strategy: str = "round_robin"
     concurrency_limit: int
     default_proxy: str
     new_account_cooldown_minutes: int
@@ -296,12 +302,22 @@ class SettingsOut(BaseModel):
     sub2api_base_url: str = ""
     sub2api_timeout: float = 30
     sub2api_group_ids: str = ""
+    # 出口代理；留空时实际回退到 default_proxy（Sub2API 按地区准入，直连常被 403）。
+    sub2api_proxy: str = ""
+    sub2api_proxy_effective: str = ""
+    # 空串=沿用 default_proxy 出口；"direct"=强制直连。
+    sub2api_proxy: str = ""
     sub2api_has_admin_api_key: bool = False
     sub2api_has_jwt: bool = False
 
 
 class SettingsUpdate(BaseModel):
     smsbower_api_key: str | None = None
+    # 多 Key 池：逗号 / 分号 / 换行分隔；空串表示清空池（回落到单 Key）
+    smsbower_api_keys: str | None = None
+    # 设置页追加新 Key；服务端会保留现有池，旧单 Key 仍作为空池兜底
+    smsbower_api_keys_append: str | None = None
+    smsbower_key_strategy: str | None = None
     smsbower_service: str | None = None
     smsbower_country: int | None = None
     smsbower_max_price: float | None = None
@@ -325,8 +341,16 @@ class CustomPoolItem(BaseModel):
     id: int
     address: str
     status: str
+    reason_code: str = ""
     allocated_at: str | None = None
     used_at: str | None = None
+    lease_expires_at: str | None = None
+    attempt_count: int = 0
+    recycle_count: int = 0
+    account_id: int | None = None
+    has_refresh_token: bool | None = None
+    credential_checked_at: str | None = None
+    last_error: str = ""
 
 
 class CFTempEmailConfig(BaseModel):
@@ -340,6 +364,7 @@ class CFTempEmailConfig(BaseModel):
     custom_pool_sample: list[str] = []
     custom_pool_status_counts: dict[str, int] = {}
     custom_pool_items: list[CustomPoolItem] = []
+    custom_pool_summary: dict[str, int | float | bool] = {}
     inbox_address: str = ""
     has_inbox_jwt: bool = False
     name_prefix: str = "reg"
@@ -387,6 +412,8 @@ class CFTempEmailUpdate(BaseModel):
     site_password: str | None = None
     address_mode: str | None = None
     custom_pool: str | None = None
+    # True 时 custom_pool 只作为增量与已保存池合并（已保存地址明文不回显，无法在前端拼接）。
+    custom_pool_append: bool | None = None
     inbox_address: str | None = None
     inbox_jwt: str | None = None
     name_prefix: str | None = None
@@ -426,3 +453,11 @@ class MailConfigTestRequest(BaseModel):
 
     provider: str | None = None
     config: dict | None = None
+
+
+class PoolActionRequest(BaseModel):
+    """邮箱池运维操作入参：按 id 操作，地址明文不出后端。"""
+
+    ids: list[int] = []
+    force: bool | None = None
+    outcome: str | None = None
