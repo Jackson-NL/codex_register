@@ -45,8 +45,10 @@ def test_env_applies_locale_screen_viewport_on_persistent_profile():
     assert options["viewport"] == {"width": 1440, "height": 900}
     assert options["device_scale_factor"] == 2.0
     assert options["persistent_context"] is True
-    # timezone 必须交给 Camoufox geoip（引擎层注入），禁止 Playwright 二次覆盖
-    assert "timezone_id" not in options
+    # timezone 必须显式传：实测 Camoufox 的 geoip 只按出口 IP 伪装经纬度/WebRTC，
+    # 算出 Asia/Tokyo 却不写进运行时（Intl 仍返回本机 Asia/Shanghai），
+    # 日本出口 + 上海时区是稳定的风控反信号。补传 timezone_id 后 Intl 立即变 Tokyo。
+    assert options["timezone_id"] == "Asia/Tokyo"
 
 
 def test_env_skips_context_only_kwargs_for_temporary_profile():
@@ -231,3 +233,56 @@ def test_human_mouse_move_returns_false_without_target():
         return await browser_stack.human_mouse_move(_FakePage(), _EmptyLocator())
 
     assert asyncio.run(run()) is False
+
+
+# ------------------------------------------------------------------
+# 指纹一致性：时区/locale/OS 必须跟着出口地区走（风控聚类维度）
+# ------------------------------------------------------------------
+
+def test_random_environment_pins_timezone_and_locale_to_region():
+    for _ in range(40):
+        env = browser_stack.random_environment("JP")
+        assert env["timezone_id"] == "Asia/Tokyo"
+        assert env["locale"] in browser_stack.locale_pool_for_region("JP")
+    for _ in range(40):
+        env = browser_stack.random_environment("US")
+        assert env["timezone_id"] in browser_stack.TIMEZONE_BY_REGION["US"]
+        assert env["locale"] == "en-US"
+
+
+def test_random_environment_unknown_region_falls_back_without_crashing():
+    env = browser_stack.random_environment("")
+    assert env["timezone_id"] in {tz for pool in browser_stack.TIMEZONE_BY_REGION.values() for tz in pool}
+    assert env["locale"] == browser_stack.LOCALES[0] or env["locale"] in browser_stack.locale_pool_for_region("")
+
+
+def test_random_environment_couples_device_scale_factor_with_os():
+    """macOS 只会是 1.0/2.0（Retina），Windows 才出现 1.25/1.5 显示缩放。"""
+    for _ in range(80):
+        env = browser_stack.random_environment("JP")
+        if env["os"] == "macos":
+            assert env["device_scale_factor"] in (1.0, 2.0)
+        else:
+            assert env["device_scale_factor"] in (1.0, 1.25, 1.5)
+
+
+def test_build_launch_options_uses_single_os_source_from_env():
+    """os 由 env 一次决定，避免 env 与启动参数各随机一次导致互相矛盾。"""
+    env = dict(browser_stack.random_environment("JP"), os="macos")
+    options = browser_stack.build_launch_options("http://127.0.0.1:7890", "D:/p/x", headless=True, env=env)
+    assert options["os"] == "macos"
+    assert options["timezone_id"] == env["timezone_id"]
+
+
+def test_build_launch_options_actually_passes_block_webrtc():
+    """形参 block_webrtc 必须进 options：历史上它被接收后直接丢弃，形同虚设。
+
+    默认 False —— 保留 RTCPeerConnection（真实 Firefox 一定有），公网地址交给
+    geoip 伪造；显式 True 才彻底关掉。
+    """
+    default = browser_stack.build_launch_options("http://127.0.0.1:7890", "D:/p/x", headless=True, env=None)
+    assert default["block_webrtc"] is False
+    blocked = browser_stack.build_launch_options(
+        "http://127.0.0.1:7890", "D:/p/x", headless=True, env=None, block_webrtc=True
+    )
+    assert blocked["block_webrtc"] is True

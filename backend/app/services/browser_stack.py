@@ -16,13 +16,6 @@ from ..config import settings
 # 引擎层：Camoufox 启动参数
 # ------------------------------------------------------------------
 
-# 阻塞 WebRTC（防 IP 泄漏指纹）的 Firefox 偏好
-WEBRTC_BLOCK_PREFS = {
-    "media.peerconnection.enabled": False,
-    "media.peerconnection.ice.default_address_only": True,
-    "media.navigator.enabled": False,
-}
-
 
 class ProfileInUseError(RuntimeError):
     """Raised when another task in this process already owns a profile."""
@@ -100,15 +93,16 @@ def build_launch_options(
     proxy: str = "",
     profile_path: str = "",
     headless: bool = False,
-    block_webrtc: bool = True,
+    block_webrtc: bool = False,
     env: dict | None = None,
 ) -> dict:
     """组装 Camoufox 启动参数（引擎层 + 环境层）
 
     - 有头模式（headless=False）：贴近真实用户，降低风控
     - humanize + geoip + os + locale：拟人化节奏 + IP 地理一致 + 系统指纹一致
-      （screen/navigator 由 Camoufox 基于 os 自动生成；WebRTC IP 泄漏由 geoip 自动伪装；
-      timezone 由 geoip 按代理出口 IP 注入引擎层，不要用 Playwright timezone_id 二次覆盖）
+      （screen/navigator 由 Camoufox 基于 os 自动生成；WebRTC 公网地址由 geoip 伪造成
+      出口 IP，需要彻底关闭时传 block_webrtc=True；timezone 见下方 env 分支——
+      geoip 不会注入运行时时区，必须显式传 Playwright 的 timezone_id）
     - user_data_dir：独立 profile（每 worker/账号）
 
     env（random_environment 产物）：
@@ -123,8 +117,13 @@ def build_launch_options(
         "headless": headless,
         "humanize": True,
         "geoip": True,
-        "os": random.choice(["windows", "macos"]),
+        "os": (env or {}).get("os") or random.choice(["windows", "macos"]),
         "locale": random.choice(["en-US", "en-GB"]),
+        # 默认不关闭 WebRTC：真实 Firefox 一定暴露 RTCPeerConnection，关掉后
+        # typeof === 'undefined' 是一行 JS 就能判的机器人特征。geoip=True 时
+        # Camoufox 会把 webrtc:ipv4 伪造成代理出口 IP（引擎层，不是 JS 层），
+        # 公网地址因此与代理一致；需要绝对断流时显式传 block_webrtc=True。
+        "block_webrtc": bool(block_webrtc),
         "timeout": BROWSER_LAUNCH_TIMEOUT_MS,
     }
     if proxy:
@@ -133,10 +132,14 @@ def build_launch_options(
         options["user_data_dir"] = profile_path
         options["persistent_context"] = True
     if env:
-        # env.locale 覆盖上面的随机兜底值；调用方已按出口地区生成。
         # locale 是 Camoufox 原生参数（launch_options 显式签名），两种启动路径都安全。
         if env.get("locale"):
             options["locale"] = env["locale"]
+        # geoip 只负责按出口 IP 伪装 WebRTC/经纬度；实测它不会把 timezone 写进
+        # 浏览器运行时（Camoufox 算出 Asia/Tokyo，Intl 仍返回本机 Asia/Shanghai），
+        # 所以时区必须由这里显式注入，否则日本出口 + 本机时区是稳定的风控反信号。
+        if env.get("timezone_id"):
+            options["timezone_id"] = env["timezone_id"]
         viewport = env.get("viewport") or {}
         width, height = int(viewport.get("width", 0)), int(viewport.get("height", 0))
         if width > 0 and height > 0:
@@ -211,6 +214,14 @@ TIMEZONE_BY_REGION = {
 }
 # 英文系 locale（OpenAI 界面保持英文，避免破坏流程文案匹配）
 LOCALES = ["en-US", "en-GB", "en-CA", "en-AU"]
+# 地区 → 与出口地理一致的 locale 子集。日语界面会打崩流程文案匹配，所以只能在
+# 英文里挑：盎格鲁地区用本地变体，其余用中性的 en-US/en-GB。
+LOCALES_BY_REGION = {
+    "US": ["en-US"],
+    "GB": ["en-GB"],
+    "CA": ["en-CA", "en-US"],
+    "AU": ["en-AU", "en-GB"],
+}
 PROXY_REGION_TIMEOUT_SECONDS = 10
 BROWSER_LAUNCH_TIMEOUT_MS = 60_000
 
@@ -237,23 +248,34 @@ async def detect_proxy_region(proxy: str = "") -> str:
         return ""
 
 
+def locale_pool_for_region(region: str = "") -> list[str]:
+    """出口地区 → 可接受的英文 locale 池（盎格鲁地区用本地变体，其余中性英文）。"""
+    return LOCALES_BY_REGION.get(str(region or "").upper()) or LOCALES[:2]
+
+
 def random_environment(region: str = "") -> dict:
     """生成一组与环境（出口 IP 地区）一致的指纹参数。
 
     - 视口/DPI：合理随机（真实用户多样）
     - 时区：优先从 region 对应时区池选（与出口 IP 一致）；region 未知时回退随机池
-    - locale：英文系随机（弱关联，OpenAI 界面保持英文）
+    - locale：按 region 取子集（盎格鲁地区用本地变体，其余中性英文）
+    - os 与 device_scale_factor 联动：2.0 基本等于 Retina/高分物理屏（macOS 常见），
+      非整数缩放 1.25/1.5 属于 Windows 显示缩放；独立随机造出 macOS+1.25 这类罕见组合。
+      os 在这里一次性决定，build_launch_options 不再另起一次随机，避免两处不一致。
     """
     w, h = random.choice(VIEWPORTS)
     tz_pool = TIMEZONE_BY_REGION.get(region) if region else None
     if not tz_pool:
         # 回退：全部时区池拍平随机
         tz_pool = [tz for pool in TIMEZONE_BY_REGION.values() for tz in pool]
+    os_name = random.choice(["windows", "macos"])
+    dsf = random.choice([1.0, 2.0, 2.0]) if os_name == "macos" else random.choice([1.0, 1.0, 1.25, 1.5])
     return {
         "viewport": {"width": w, "height": h},
         "timezone_id": random.choice(tz_pool),
-        "locale": random.choice(LOCALES),
-        "device_scale_factor": random.choice([1, 1, 1.25, 2]),
+        "locale": random.choice(locale_pool_for_region(region)),
+        "device_scale_factor": dsf,
+        "os": os_name,
     }
 
 

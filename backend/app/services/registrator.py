@@ -44,7 +44,6 @@ from .browser_stack import (
 from .cf_layer import solve_turnstile, combined_judgment, detect_turnstile
 from .console_logging import enqueue_console_print
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 # ------------------------------------------------------------------
 # 实时日志钩子：注册执行器注入任务日志容器，print 统一走 emit_log
@@ -5546,6 +5545,7 @@ class Registrator:
                         locale=env["locale"],
                         viewport=env["viewport"],
                         device_scale_factor=env["device_scale_factor"],
+                        timezone_id=env["timezone_id"],
                     )
                     page = await context.new_page()
 
