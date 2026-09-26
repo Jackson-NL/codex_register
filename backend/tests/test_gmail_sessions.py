@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from datetime import timedelta
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -314,3 +315,72 @@ def test_next_alias_marks_session_expired_after_last_allowed_alias(monkeypatch):
     assert result["counter"] == 3
     assert session.status == "expired"
     assert session.expired_reason == "达到最大验证码次数"
+
+
+def _patch_prepare_next_code(monkeypatch, error):
+    async def fake_prepare_next_code(self, mail_id):
+        raise error
+
+    monkeypatch.setattr(gmail_sessions.SmsbowerMailClient, "prepare_next_code", fake_prepare_next_code)
+
+
+def test_upstream_end_of_codes_raises_400_and_expires_session(monkeypatch):
+    """上游说没码了是订单正常收尾：必须回 400 + 耗尽文案，让协调器租新号。
+
+    回 502 会被取号重试判成"可重试抖动"，重试用尽后直接终止整批。
+    """
+    from fastapi import HTTPException
+
+    from app.services.smsbower_mail import SmsbowerMailError
+
+    db = _db_session()
+    session = GmailSession(base_email="first@gmail.com", mail_id="mail-1", alias_counter=1, status="active", max_aliases=15)
+    db.add(session)
+    db.commit()
+    _patch_prepare_next_code(monkeypatch, SmsbowerMailError("activation 不可复用: status=3 description=finished"))
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(gmail_sessions.get_next_alias(db=db))
+
+    assert caught.value.status_code == 400
+    assert "Maximum number of codes reached" in str(caught.value.detail)
+    db.refresh(session)
+    assert session.status == "expired"
+    assert "上游已无可用验证码" in (session.expired_reason or "")
+
+
+def test_transient_upstream_failure_still_raises_502(monkeypatch):
+    """网络抖动不能被当成"订单结束"，否则会把还能收码的号提前释放。"""
+    from fastapi import HTTPException
+
+    from app.services.smsbower_mail import SmsbowerMailError
+
+    db = _db_session()
+    session = GmailSession(base_email="first@gmail.com", mail_id="mail-1", alias_counter=1, status="active", max_aliases=15)
+    db.add(session)
+    db.commit()
+    _patch_prepare_next_code(monkeypatch, SmsbowerMailError("curl 重试后仍失败"))
+
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(gmail_sessions.get_next_alias(db=db))
+
+    assert caught.value.status_code == 502
+    db.refresh(session)
+    assert session.status == "active"
+
+
+def test_local_alias_ceiling_is_only_a_runaway_guard():
+    """上限已交给上游，本地值只防失控，必须明显高于常见订单的真实收码次数。"""
+    assert gmail_sessions.DEFAULT_MAX_ALIASES >= 10
+
+
+def test_latest_finished_session_picks_newest_inactive_one():
+    db = _db_session()
+    old = GmailSession(base_email="old@gmail.com", mail_id="m-old", alias_counter=1, status="expired", expired_reason="上游已无可用验证码")
+    active = GmailSession(base_email="live@gmail.com", mail_id="m-live", alias_counter=0, status="active")
+    db.add_all([old, active])
+    db.commit()
+
+    picked = gmail_sessions.latest_finished_session(db)
+
+    assert picked is not None and picked.id == old.id

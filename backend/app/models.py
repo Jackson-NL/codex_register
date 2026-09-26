@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
+from .config import settings
 from .db import Base
 
 
@@ -238,7 +239,8 @@ class GmailSession(Base):
     mail_id: Mapped[str] = mapped_column(String(64), default="")
     alias_counter: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(16), default="active")  # active/expired
-    max_aliases: Mapped[int] = mapped_column(Integer, default=3)  # 同一订单最多复用次数（含首次）
+    # 本地兜底上限（真实可收码次数由 SMSBower 决定），与 settings 同源避免两处漂移。
+    max_aliases: Mapped[int] = mapped_column(Integer, default=lambda: settings.smsbower_gmail_alias_ceiling)
     otp_timeout_streak: Mapped[int] = mapped_column(Integer, default=0)  # 连续未收到验证码次数
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     expired_reason: Mapped[str] = mapped_column(String(256), default="")

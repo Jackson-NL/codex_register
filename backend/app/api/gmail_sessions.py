@@ -12,7 +12,11 @@ from ..models import GmailSession, utcnow
 from ..schemas import OrmModel
 from ..services.smsbower_mail import SmsbowerMailClient, SmsbowerMailError
 
-DEFAULT_MAX_ALIASES = 3  # 同一 SMSBower Mail 订单最多复用次数（含首次）
+# 本地防失控兜底，不是业务上限：一个 SMSBower Mail 订单实际能收几封验证码由上游决定
+# （getStatus 的 available_to_get_next_code，或 setStatus=5 返回的
+# "Maximum number of codes reached"）。这里曾写死 3，会把本来还能继续收码的订单
+# 提前判死、白白租新号扣费；真实耗尽由 get_next_alias 识别上游错误后结束订单。
+DEFAULT_MAX_ALIASES = settings.smsbower_gmail_alias_ceiling
 
 
 class GmailSessionOut(OrmModel):
@@ -109,6 +113,21 @@ def _expire_if_exhausted(session: GmailSession | None, db: Session) -> bool:
         db.commit()
         return True
     return False
+
+
+def latest_finished_session(db: Session):
+    """最近一条已结束的会话（非 active）。
+
+    批量协调器在租新号前抓一条，用来判定"上一个主邮箱订单已收尾"：订单可能是被
+    上游判死、超时、或撞到本地兜底上限，三种都算用完一单，需要计入
+    gmail_orders_completed，否则 target 按订单数计就会永远到不了。
+    """
+    return db.scalar(
+        select(GmailSession)
+        .where(GmailSession.status != "active")
+        .order_by(GmailSession.id.desc())
+        .limit(1)
+    )
 
 
 def _remote_inactive_reason(data: dict) -> str:
@@ -387,13 +406,18 @@ async def get_next_alias(db: Session = Depends(get_db)):
         try:
             await client.prepare_next_code(session.mail_id)
         except SmsbowerMailError as e:
+            text = str(e)
             if (
-                "activation 不可复用" in str(e)
-                or "Activation is already canceled" in str(e)
-                or "Maximum number of codes reached" in str(e)
+                "activation 不可复用" in text
+                or "Activation is already canceled" in text
+                or "Maximum number of codes reached" in text
             ):
-                _mark_expired(session, f"准备下一验证码失败: {str(e)[:120]}")
+                _mark_expired(session, f"上游已无可用验证码: {text[:120]}")
                 db.commit()
+                # 这是订单正常收尾，不是上游 5xx 故障：必须回 400 + 耗尽文案，
+                # 让批量协调器走"租新号"分支；回 502 会被取号重试判成可重试，
+                # 重试用尽后直接终止整批。
+                raise HTTPException(400, f"Maximum number of codes reached（上游: {text[:120]}）")
             raise HTTPException(502, f"SMSBower Mail 设置等待下一验证码失败: {e}")
 
     session.alias_counter += 1

@@ -706,6 +706,40 @@ class GoogleLoginPageNotConsumedError(GmailPreVerificationNotConsumedError):
         super().__init__("email", detail)
 
 
+class EmailNavigationNotConsumedError(GmailPreVerificationNotConsumedError):
+    """邮箱验证前的导航被网络层打断（代理抖动/节点切换），未触发验证码，不消耗配额。
+
+    典型形态：`Page.reload: Timeout 60000ms exceeded`、`Page.goto: NS_ERROR_ABORT`。
+    这类失败与 OpenAI 风控无关，重开浏览器就能继续，没理由烧掉订单的一次收码机会。
+    """
+
+    non_consuming_reason = "email_navigation_failure"
+
+    def __init__(self, detail: str):
+        super().__init__("email", detail)
+
+
+# Playwright 网络/导航层错误的特征串（小写匹配）。刻意不收裸 "timeout"，
+# 避免把验证码超时、阶段超时这类真实消耗配额的失败误判成不消耗。
+NAVIGATION_ERROR_MARKERS = (
+    "page.reload:",
+    "page.goto:",
+    "page.wait_for_load_state",
+    "ns_error",
+    "ns_binding_aborted",
+    "net::err",
+    "err_connection",
+    "err_network",
+    "target closed",
+    "browser has been closed",
+)
+
+
+def is_navigation_layer_error(error: Exception) -> bool:
+    text = str(error or "").lower()
+    return any(marker in text for marker in NAVIGATION_ERROR_MARKERS)
+
+
 def is_google_login_page_snapshot(detail: dict) -> bool:
     """仅识别仍在 Google 身份页的场景，避免普通页面卡住被误判为未消耗。"""
     body = str((detail or {}).get("bodyText") or "").lower()
@@ -1886,6 +1920,71 @@ async def submit_email_with_recovery(page, address: str, max_recover: int = 2) -
             await wait_spa_ready(page)
             continue
         return False
+
+
+_PAGE_SHELL_JS = """
+() => {
+    const nodes = Array.from(document.querySelectorAll('button, a, input, [role="button"]'));
+    const body = document.body ? (document.body.innerText || '') : '';
+    return {
+        ready: document.readyState,
+        interactive: nodes.length,
+        labels: nodes.map(el => (el.textContent || '').trim()).filter(Boolean).slice(0, 20),
+        text: body.replace(/\\s+/g, ' ').trim().slice(0, 200),
+    };
+}
+"""
+
+
+def _shell_is_blank(shell: dict) -> bool:
+    """空壳判定：既没有可交互元素也没有正文。真限流页一定有文案或按钮。"""
+    return not (shell.get("labels") or []) and not str(shell.get("text") or "").strip()
+
+
+async def probe_page_shell(page) -> dict:
+    try:
+        return await page.evaluate(_PAGE_SHELL_JS)
+    except Exception:
+        # 导航瞬间 execution context 会被销毁，按未知处理，交给下一轮循环再判
+        return {"ready": "unknown", "interactive": -1, "labels": [], "text": ""}
+
+
+async def wait_continue_with_password(page, timeout_s: float = 30.0, reload_limit: int = 2, log=None):
+    """等 email-verification 渲染出 Continue with password，页面空壳时 reload 恢复。
+
+    失败样本 reg_2193/2195/2196 的验证页整块没挂载（0 个可交互元素、正文为空），
+    同一个 base 邮箱下一轮（1 分钟后）就正常注册成功：这是卡住，不是域名限流，
+    不能一探测不到就抛 EmailDomainBlockedError 白扔一轮 Gmail 配额。
+    """
+    emit = log or (lambda _message: None)
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout_s
+    reloads = 0
+    while True:
+        link = await pick_visible(page.locator('text=Continue with password'), timeout_s=4.0)
+        if link is not None:
+            if reloads:
+                emit(f"[stage:password] ✓ reload {reloads} 次后验证页恢复，已找到 Continue with password")
+            return link
+        if loop.time() >= deadline:
+            return None
+        shell = await probe_page_shell(page)
+        if not _shell_is_blank(shell):
+            await asyncio.sleep(1.0)
+            continue
+        if reloads >= reload_limit:
+            emit(f"[stage:password] 验证页 reload {reloads} 次后仍是空壳，放弃恢复 url={page.url[:120]}")
+            return None
+        reloads += 1
+        emit(
+            f"[stage:password] 验证页空壳（ready={shell.get('ready')} 可交互={shell.get('interactive')}），"
+            f"reload 恢复 ({reloads}/{reload_limit})"
+        )
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=60000)
+        except Exception as error:
+            emit(f"[stage:password] reload 未完成，继续等待：{str(error)[:120]}")
+        await wait_spa_ready(page)
 
 
 async def find_and_click(page, texts: list[str], role: str = "button") -> bool:
@@ -5610,7 +5709,17 @@ class Registrator:
 
                 # 1. 邮箱注册入口 — 等 React 水合后再交互，避免原生表单提交
                 emit_log("[stage:browser] 打开 chatgpt 登录页并等待 SPA 水合", flush=True)
-                await page.goto("https://chatgpt.com/auth/login", wait_until="domcontentloaded", timeout=60000)
+                try:
+                    await page.goto("https://chatgpt.com/auth/login", wait_until="domcontentloaded", timeout=60000)
+                except Exception as error:  # noqa: BLE001
+                    if not (gmail_mode and is_navigation_layer_error(error)):
+                        raise
+                    emit_log(
+                        f"[gmail] 打开登录页被网络层中断（{str(error)[:120]}）；"
+                        "未提交邮箱，本轮不消耗 Gmail 配额",
+                        flush=True,
+                    )
+                    raise EmailNavigationNotConsumedError(f"打开登录页网络中断: {str(error)[:160]}") from error
                 await wait_spa_ready(page)
                 state = await probe_page(page)
                 emit_log(f"[stage:browser] 登录页探测 phase={state['phase']} url={state['url'][:120]}", flush=True)
@@ -5635,6 +5744,17 @@ class Registrator:
                         )
                         raise EmailSubmitNotConsumedError("邮箱提交动作未完成") from error
                     raise
+                except Exception as error:  # noqa: BLE001
+                    # submit_email_with_recovery 里的 page.reload 恢复步骤会把
+                    # 网络层异常原样抛出（Page.reload: Timeout / NS_ERROR_ABORT）。
+                    if not (gmail_mode and is_navigation_layer_error(error)):
+                        raise
+                    emit_log(
+                        f"[gmail] 邮箱提交流程被网络层中断（{str(error)[:120]}）；"
+                        "未进入邮箱验证，本轮不消耗 Gmail 配额",
+                        flush=True,
+                    )
+                    raise EmailNavigationNotConsumedError(f"邮箱提交网络中断: {str(error)[:160]}") from error
 
                 # 探测器：等待 email-verification 或直跳 set_password（新链路：邮箱提交后直跳 /create-account/password）
                 try:
@@ -5680,7 +5800,9 @@ class Registrator:
                 if state["phase"] == PHASE_EMAIL_VERIFICATION:
                     await asyncio.sleep(step_pause())
                     emit_log("[stage:password] 查找 Continue with password 入口", flush=True)
-                    link = await pick_visible(page.locator('text=Continue with password'))
+                    link = await wait_continue_with_password(
+                        page, log=lambda message: emit_log(message, flush=True)
+                    )
                     if link is not None:
                         await human_mouse_move(page, link)
                         await random_pace(120, 300)
@@ -5694,11 +5816,11 @@ class Registrator:
                         if state["phase"] not in (PHASE_SET_PASSWORD, PHASE_EMAIL_VERIFICATION):
                             raise WrongPhaseError("email", PHASE_SET_PASSWORD, state["phase"], state["url"], "Continue with password 后")
                     else:
-                        btns = await page.evaluate("""
-                            () => Array.from(document.querySelectorAll('button, a'))
-                                .map(el => (el.textContent || '').trim()).filter(Boolean).slice(0, 20)
-                        """)
-                        emit_log(f"[trace] 无 Continue with password，页面按钮: {btns}", flush=True)
+                        shell = await probe_page_shell(page)
+                        emit_log(f"[trace] 无 Continue with password，页面按钮: {shell.get('labels')}", flush=True)
+                        if _shell_is_blank(shell):
+                            # 页面根本没渲染出来，不能算域名限流
+                            raise EmailDomainBlockedError("验证页空渲染（reload 后仍无内容）")
                         # 第二层信号：域名被限流（OpenAI 对临时邮箱域名的风控信号）
                         raise EmailDomainBlockedError("未找到 Continue with password")
                 else:

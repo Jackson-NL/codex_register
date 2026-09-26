@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     smsbower_service: str = "dr"
     smsbower_country: int = 73
     smsbower_max_price: float = 0.034
+    # 同一个 Gmail 订单本地允许复用的最大轮次。真实上限由 SMSBower 决定
+    # （getStatus.available_to_get_next_code / setStatus=5 的耗尽报错），这里只作
+    # 防失控兜底：避免上游异常时协调器在同一订单上无限循环取号。
+    smsbower_gmail_alias_ceiling: int = 15
     smsbower_timeout: int = 20
     smsbower_poll_interval: int = 4
     smsbower_poll_timeout: int = 120

@@ -18,6 +18,14 @@ MAX_BATCH_LOG_LINES = 0
 # Gmail 取号退避重试：首次失败后再试 3 次（2s / 5s / 10s）。
 # 只兜住 SMSBower 与网络的偶发故障——此前一次 502 就会让整批 canceled，
 # 剩余名额全部作废且不会自动续跑。测试可直接改写本元组以免真实等待。
+# 验证码开始前的失败白名单：这些原因只补一次 alias 配额，不算消耗订单轮次。
+# 必须与 registrator 里各 *NotConsumedError.non_consuming_reason 同步维护。
+GMAIL_NON_CONSUMING_REASONS = frozenset({
+    "email_submit_not_completed",
+    "email_post_submit_not_consumed",
+    "google_login_page",
+    "email_navigation_failure",
+})
 GMAIL_ALIAS_RETRY_DELAYS: tuple[float, ...] = (2.0, 5.0, 10.0)
 GMAIL_ALIAS_RETRYABLE_STATUS = frozenset({502, 503, 504})
 # 余额/库存/鉴权类失败重试必然还是失败，直接终止，不做无意义退避。
@@ -130,6 +138,8 @@ class BatchCoordinator:
             active_ids: set[int] = set()
             pool_pause_logged = False
 
+            # 已计入完成数的主邮箱订单会话 id（进程内，防重复计数）。
+            credited_gmail_orders: set[int] = set()
             while batch.status == "running":
                 db.refresh(batch)
 
@@ -209,6 +219,14 @@ class BatchCoordinator:
                             db,
                             log=lambda message: self._append_log(batch_id, message),
                         )
+                        if credit_finished_gmail_order(batch, gmail_meta, credited_gmail_orders):
+                            self._append_log(
+                                batch_id,
+                                f"[gmail] 上一主邮箱订单 #{gmail_meta.get('gmail_previous_session_id')} 已收尾"
+                                f"（{gmail_meta.get('gmail_previous_expired_reason') or '已用完'}），"
+                                f"计入完成数 {batch.gmail_orders_completed}/{batch.target}",
+                            )
+                        db.commit()
                         self._append_log(batch_id, f"[gmail] batch_{batch_id} 地址已准备：{gmail_alias} mail_id={gmail_mail_id}")
                     reg_id = await self.reg_service.submit(
                         proxy=batch.proxy,
@@ -349,11 +367,7 @@ class BatchCoordinator:
         except (TypeError, ValueError):
             return False
         if (
-            draft.get("gmail_non_consuming_failure") not in {
-                "email_submit_not_completed",
-                "email_post_submit_not_consumed",
-                "google_login_page",
-            }
+            draft.get("gmail_non_consuming_failure") not in GMAIL_NON_CONSUMING_REASONS
             or draft.get("gmail_quota_extension_applied")
         ):
             return False
@@ -401,13 +415,29 @@ def gmail_registration_finishes_order(reg: Registration) -> bool:
         draft = json.loads(reg.result_json or "{}")
     except (TypeError, ValueError):
         return False
-    if draft.get("gmail_non_consuming_failure") in {
-        "email_submit_not_completed",
-        "email_post_submit_not_consumed",
-        "google_login_page",
-    }:
+    if draft.get("gmail_non_consuming_failure") in GMAIL_NON_CONSUMING_REASONS:
         return False
     return draft.get("gmail_exhausted_after_alias") is True
+
+
+def credit_finished_gmail_order(batch: Batch, meta: dict | None, credited: set[int]) -> bool:
+    """把"上一个主邮箱订单已收尾"计入 gmail_orders_completed，同一会话只计一次。
+
+    上限交给上游判定后，一单能收几封码不再等于本地 max_aliases，原来靠
+    `exhausted` 在注册结束时计数的路径不再必然触发；协调器改在"为下一单租号"
+    这一刻补计。`credited` 是进程内的每批次集合，避免同一会话被重复计数。
+    """
+    if not meta or not meta.get("gmail_previous_order_finished"):
+        return False
+    try:
+        session_id = int(meta.get("gmail_previous_session_id") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not session_id or session_id in credited:
+        return False
+    credited.add(session_id)
+    batch.gmail_orders_completed = int(batch.gmail_orders_completed or 0) + 1
+    return True
 
 
 def pool_stop_reason(batch: Batch) -> str:
@@ -448,7 +478,11 @@ async def _acquire_gmail_alias(db, log) -> tuple[dict, str]:
     active = gmail_sessions.get_active_gmail(db=db)
     order_action = "reuse_active" if active and active.remaining > 0 else "rent_new"
     log(f"[gmail] 订单策略：{order_action}")
+    previous = None
     if not active or active.remaining <= 0:
+        # 租新号前先记下上一条已结束订单：上限改由上游判定后，本地 exhausted
+        # 标记不再必然出现，协调器要靠它在租下一单时把上一单计入完成数。
+        previous = gmail_sessions.latest_finished_session(db)
         log("[gmail] 没有可复用订单，开始自动租用 Gmail")
         await gmail_sessions.rent_gmail(db=db)
         log("[gmail] Gmail 订单租用完成")
@@ -463,11 +497,17 @@ async def _acquire_gmail_alias(db, log) -> tuple[dict, str]:
             or "会话已过期" in message
         ):
             order_action = "rent_after_expired"
+            previous = previous or gmail_sessions.latest_finished_session(db)
             await gmail_sessions.rent_gmail(db=db)
             log("[gmail] 旧订单已耗尽，已重新租用 Gmail")
             item = await gmail_sessions.get_next_alias(db=db)
         else:
             raise
+    if previous is not None:
+        item["previous_order_finished"] = True
+        item["previous_session_id"] = previous.id
+        item["previous_order_status"] = previous.status
+        item["previous_expired_reason"] = previous.expired_reason or ""
     return item, order_action
 
 
@@ -532,6 +572,9 @@ async def _next_gmail_alias(db, log=None) -> tuple[str, str, dict]:
         "gmail_expires_at": item.get("expires_at"),
         "gmail_expires_in_seconds": item.get("expires_in_seconds"),
         "gmail_exhausted_after_alias": item.get("exhausted", False),
+        "gmail_previous_order_finished": bool(item.get("previous_order_finished")),
+        "gmail_previous_session_id": item.get("previous_session_id"),
+        "gmail_previous_expired_reason": item.get("previous_expired_reason", ""),
         "proxy_rotate_ok": proxy_rotation.get("ok", False),
         "proxy_rotate_skipped": proxy_rotation.get("skipped", False),
         "proxy_rotate_selector": proxy_rotation.get("selector", ""),

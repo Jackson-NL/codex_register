@@ -19,6 +19,7 @@ from app.services.registrator import (
     _debug_screenshot_loop,
     click_about_you_submit,
     CloudflareChallengeError,
+    EmailNavigationNotConsumedError,
     EmailSubmitNotConsumedError,
     EmailPostSubmitNotConsumedError,
     _DebugBrowserContext,
@@ -33,6 +34,7 @@ from app.services.registrator import (
     pick_visible,
     submit_email_with_recovery,
     wait_for_password_or_code_entry,
+    is_navigation_layer_error,
 )
 
 
@@ -883,6 +885,109 @@ class PasswordFillRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.reload_calls, 3)
 
 
+class ContinueWithPasswordWaitTests(unittest.IsolatedAsyncioTestCase):
+    """email-verification 空渲染应 reload 恢复，而不是立刻判成邮箱域名被限流。"""
+
+    @staticmethod
+    def _shell(labels=None, text=""):
+        return {"ready": "complete", "interactive": len(labels or []), "labels": labels or [], "text": text}
+
+    def test_blank_rule_requires_both_labels_and_text_missing(self):
+        from app.services import registrator as registrator_module
+
+        self.assertTrue(registrator_module._shell_is_blank(self._shell()))
+        self.assertFalse(registrator_module._shell_is_blank(self._shell(text="Something went wrong")))
+        self.assertFalse(registrator_module._shell_is_blank(self._shell(labels=["Log in"])))
+
+    async def test_reloads_blank_page_and_returns_late_link(self):
+        from app.services import registrator as registrator_module
+
+        class FakePage:
+            url = "https://auth.openai.com/email-verification"
+
+            def __init__(self):
+                self.reload_calls = 0
+
+            def locator(self, _selector):
+                return object()
+
+            async def reload(self, **_kwargs):
+                self.reload_calls += 1
+
+        page = FakePage()
+        link = object()
+        with (
+            patch.object(
+                registrator_module, "pick_visible", new=AsyncMock(side_effect=[None, link])
+            ),
+            patch.object(
+                registrator_module,
+                "probe_page_shell",
+                new=AsyncMock(side_effect=[self._shell(), self._shell(labels=["x"])]),
+            ),
+            patch.object(registrator_module, "wait_spa_ready", new=AsyncMock()),
+        ):
+            found = await registrator_module.wait_continue_with_password(page, timeout_s=10, reload_limit=2)
+        self.assertIs(found, link)
+        self.assertEqual(page.reload_calls, 1)
+
+    async def test_rendered_page_without_entry_is_not_reloaded(self):
+        from app.services import registrator as registrator_module
+
+        class FakePage:
+            url = "https://auth.openai.com/email-verification"
+
+            def __init__(self):
+                self.reload_calls = 0
+
+            def locator(self, _selector):
+                return object()
+
+            async def reload(self, **_kwargs):  # pragma: no cover - must not reload
+                self.reload_calls += 1
+
+        page = FakePage()
+        rendered = self._shell(labels=["Continue with Google", "Try it first"], text="Log in or sign up")
+        with (
+            patch.object(registrator_module, "pick_visible", new=AsyncMock(return_value=None)),
+            patch.object(registrator_module, "probe_page_shell", new=AsyncMock(return_value=rendered)),
+            patch.object(registrator_module, "wait_spa_ready", new=AsyncMock()),
+        ):
+            found = await registrator_module.wait_continue_with_password(page, timeout_s=0.3, reload_limit=2)
+        self.assertIsNone(found)
+        self.assertEqual(page.reload_calls, 0)
+
+    async def test_persistent_blank_gives_up_after_reload_limit(self):
+        from app.services import registrator as registrator_module
+
+        class FakePage:
+            url = "https://auth.openai.com/email-verification"
+
+            def __init__(self):
+                self.reload_calls = 0
+
+            def locator(self, _selector):
+                return object()
+
+            async def reload(self, **_kwargs):
+                self.reload_calls += 1
+
+        page = FakePage()
+        messages = []
+        with (
+            patch.object(registrator_module, "pick_visible", new=AsyncMock(return_value=None)),
+            patch.object(registrator_module, "probe_page_shell", new=AsyncMock(return_value=self._shell())),
+            patch.object(registrator_module, "wait_spa_ready", new=AsyncMock()),
+        ):
+            found = await registrator_module.wait_continue_with_password(
+                page, timeout_s=10, reload_limit=2, log=messages.append
+            )
+        self.assertIsNone(found)
+        self.assertEqual(page.reload_calls, 2)
+        self.assertTrue(any("空壳" in m for m in messages))
+        self.assertTrue(any("放弃恢复" in m for m in messages))
+
+
 class CodeFillRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_refreshes_and_refills_code_after_input_timeout(self):
         from app.services import registrator as registrator_module
@@ -1092,6 +1197,29 @@ class PhoneNumberTests(unittest.TestCase):
     def test_email_post_submit_stuck_has_a_non_consuming_gmail_marker(self):
         error = EmailPostSubmitNotConsumedError("邮箱提交后未跳转验证页")
         self.assertEqual(error.non_consuming_reason, "email_post_submit_not_consumed")
+
+    def test_email_navigation_failure_has_a_non_consuming_gmail_marker(self):
+        error = EmailNavigationNotConsumedError("邮箱提交网络中断")
+        self.assertEqual(error.non_consuming_reason, "email_navigation_failure")
+        self.assertEqual(error.stage, "email")
+
+    def test_is_navigation_layer_error_matches_only_network_layer_failures(self):
+        # 真实网络层报错判成不消耗；验证码超时与风控类报错绝不能误判。
+        for message in (
+            'Page.reload: Timeout 60000ms exceeded. waiting until "domcontentloaded"',
+            'Page.goto: NS_ERROR_ABORT navigating to "https://chatgpt.com/auth/login"',
+            'Page.goto: net::ERR_CONNECTION_RESET at https://chatgpt.com/auth/login',
+            'Target page, context or browser has been closed',
+        ):
+            self.assertTrue(is_navigation_layer_error(RuntimeError(message)), message)
+        for message in (
+            'otp: 轮询验证码超时，已对 mail_id=25517831 做最终确认',
+            'cloudflare: Cloudflare 挑战拦截',
+            'email: 预期阶段[email_verification]实际[unknown] url= 设密码后',
+            'Timeout 60000ms exceeded while waiting for selector',
+        ):
+            self.assertFalse(is_navigation_layer_error(RuntimeError(message)), message)
+
 
     def test_about_you_finish_wait_budget_is_sixty_seconds(self):
         self.assertEqual(ABOUT_YOU_FINISH_TIMEOUT_SECONDS, 60)

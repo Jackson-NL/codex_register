@@ -78,7 +78,12 @@ def test_gmail_registration_finishes_primary_order_only_on_consuming_final_round
     assert gmail_registration_finishes_order(middle_round) is False
 
 
-@pytest.mark.parametrize("reason", ["google_login_page", "email_submit_not_completed", "email_post_submit_not_consumed"])
+@pytest.mark.parametrize("reason", [
+    "google_login_page",
+    "email_submit_not_completed",
+    "email_post_submit_not_consumed",
+    "email_navigation_failure",
+])
 def test_pre_verification_gmail_failure_is_not_counted_and_extends_next_alias_quota(reason):
     db = _db_session()
     from app.models import GmailSession, Registration
@@ -623,3 +628,69 @@ def test_pool_stop_reason_only_for_exhausted_custom_pool(monkeypatch):
             db.commit()
         finally:
             db.close()
+
+
+def test_credit_finished_gmail_order_counts_each_session_once():
+    from types import SimpleNamespace
+
+    batch = SimpleNamespace(gmail_orders_completed=0)
+    credited: set[int] = set()
+    meta = {"gmail_previous_order_finished": True, "gmail_previous_session_id": 3}
+
+    assert batch_service.credit_finished_gmail_order(batch, meta, credited) is True
+    assert batch.gmail_orders_completed == 1
+    # 同一会话重复上报不再计数
+    assert batch_service.credit_finished_gmail_order(batch, meta, credited) is False
+    assert batch_service.credit_finished_gmail_order(batch, None, credited) is False
+    assert batch_service.credit_finished_gmail_order(
+        batch, {"gmail_previous_order_finished": True, "gmail_previous_session_id": None}, credited
+    ) is False
+    assert batch.gmail_orders_completed == 1
+
+
+def test_next_gmail_alias_reports_previous_finished_order_when_renting(monkeypatch):
+    """上限交给上游判定后，"租下一单"这一刻才是一单真正结束的时刻，必须回传给协调器。"""
+    import asyncio
+    from types import SimpleNamespace
+
+    from app.api import gmail_sessions
+
+    db = _db_session()
+    calls = []
+
+    async def ok_alias(**kwargs):
+        return _gmail_alias_payload()
+
+    monkeypatch.setattr(
+        gmail_sessions,
+        "latest_finished_session",
+        lambda db=None, **kwargs: SimpleNamespace(id=7, status="expired", expired_reason="上游已无可用验证码"),
+    )
+    _install_gmail_stubs(monkeypatch, ok_alias, active_remaining=0, calls=calls)
+
+    _alias, _mail_id, meta = asyncio.run(batch_service._next_gmail_alias(db, log=lambda m: None))
+
+    assert "rent" in calls
+    assert meta["gmail_previous_order_finished"] is True
+    assert meta["gmail_previous_session_id"] == 7
+    assert meta["gmail_previous_expired_reason"] == "上游已无可用验证码"
+
+
+def test_next_gmail_alias_has_no_previous_order_on_first_rent(monkeypatch):
+    """批次第一单之前没有任何会话，不能凭空计入完成数。"""
+    import asyncio
+
+    from app.api import gmail_sessions
+
+    db = _db_session()
+
+    async def ok_alias(**kwargs):
+        return _gmail_alias_payload()
+
+    monkeypatch.setattr(gmail_sessions, "latest_finished_session", lambda db=None, **kwargs: None)
+    _install_gmail_stubs(monkeypatch, ok_alias, active_remaining=0)
+
+    _alias, _mail_id, meta = asyncio.run(batch_service._next_gmail_alias(db, log=lambda m: None))
+
+    assert meta["gmail_previous_order_finished"] is False
+    assert meta["gmail_previous_session_id"] is None
