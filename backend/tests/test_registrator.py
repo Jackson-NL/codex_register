@@ -1625,6 +1625,91 @@ class WaitForPhaseChallengeGraceTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(registrator_module.CloudflareChallengeError):
                 await registrator_module.wait_for_phase(object(), registrator_module.PHASE_CHATGPT_HOME, 5, "email")
 
+    async def test_account_exists_error_page_skips_grace_entirely(self):
+        """"账号可能已存在"是终局：不该再等 60 秒宽限，立刻失败让批次开下一轮。"""
+        from app.services import registrator as registrator_module
+
+        probe = AsyncMock(return_value={
+            "phase": registrator_module.PHASE_PAGE_ERROR,
+            "url": "https://auth.openai.com/create-account/password",
+            "title": "Oops! Something went wrong",
+            "bodyText": "Oops! Something went wrong.",
+        })
+        logs = []
+        with (
+            patch.object(registrator_module, "probe_page", new=probe),
+            patch.object(registrator_module, "emit_log", new=lambda msg, **kw: logs.append(msg)),
+        ):
+            with self.assertRaises(registrator_module.OpenAIErrorPageError):
+                await registrator_module.wait_for_phase(
+                    object(), registrator_module.PHASE_CHATGPT_HOME, 60, "email",
+                    interval=0.01, challenge_grace_s=60,
+                )
+
+        self.assertEqual(probe.await_count, 1, "不应进入宽限轮询")
+        self.assertTrue(any("立即判定失败" in m for m in logs))
+
+    async def test_server_transient_error_page_keeps_full_grace(self):
+        """服务端临时错误值得等：宽限期内恢复就继续。"""
+        from app.services import registrator as registrator_module
+
+        states = [
+            {
+                "phase": registrator_module.PHASE_PAGE_ERROR,
+                "url": "https://chatgpt.com/",
+                "title": "Oops",
+                "bodyText": "Internal server error",
+            },
+            {"phase": registrator_module.PHASE_CHATGPT_HOME, "url": "https://chatgpt.com/", "title": ""},
+        ]
+        probe = AsyncMock(side_effect=states)
+        logs = []
+        with (
+            patch.object(registrator_module, "probe_page", new=probe),
+            patch.object(registrator_module, "emit_log", new=lambda msg, **kw: logs.append(msg)),
+        ):
+            state = await registrator_module.wait_for_phase(
+                object(), registrator_module.PHASE_CHATGPT_HOME, 5, "email",
+                interval=0.01, challenge_grace_s=30,
+            )
+
+        self.assertEqual(state["phase"], registrator_module.PHASE_CHATGPT_HOME)
+        self.assertTrue(any("宽限 30s" in m for m in logs))
+
+    async def test_generic_error_page_uses_short_grace(self):
+        """认不出子类型的错误页只给 10 秒，不跟着配置等满一分钟。"""
+        from app.services import registrator as registrator_module
+
+        states = [
+            {"phase": registrator_module.PHASE_PAGE_ERROR, "url": "https://chatgpt.com/billing", "title": "Oops", "bodyText": "Oops"},
+            {"phase": registrator_module.PHASE_CHATGPT_HOME, "url": "https://chatgpt.com/", "title": ""},
+        ]
+        probe = AsyncMock(side_effect=states)
+        logs = []
+        with (
+            patch.object(registrator_module, "probe_page", new=probe),
+            patch.object(registrator_module, "emit_log", new=lambda msg, **kw: logs.append(msg)),
+        ):
+            await registrator_module.wait_for_phase(
+                object(), registrator_module.PHASE_CHATGPT_HOME, 5, "email",
+                interval=0.01, challenge_grace_s=60,
+            )
+
+        self.assertTrue(any("宽限 10s" in m for m in logs))
+
+    def test_page_error_grace_table(self):
+        from app.services import registrator as registrator_module
+
+        exists = {"url": "https://auth.openai.com/signup", "title": "", "bodyText": ""}
+        transient = {"url": "https://chatgpt.com/", "title": "", "bodyText": "route error"}
+        generic = {"url": "https://chatgpt.com/oops", "title": "", "bodyText": "Oops"}
+        self.assertEqual(registrator_module._page_error_grace(exists, 60), 0.0)
+        self.assertEqual(registrator_module._page_error_grace(transient, 60), 60)
+        self.assertEqual(
+            registrator_module._page_error_grace(generic, 60),
+            registrator_module.PAGE_ERROR_GENERIC_GRACE_SECONDS,
+        )
+
 
 class ProviderUnavailableTests(unittest.TestCase):
     def test_detects_whatsapp_switch_and_cannot_send(self):

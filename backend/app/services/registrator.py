@@ -922,16 +922,36 @@ def _format_phone_log_context(
     )
 
 
+PAGE_ERROR_ACCOUNT_EXISTS = "账号可能已存在"
+PAGE_ERROR_SERVER_TRANSIENT = "OpenAI 服务端临时错误"
+# 通用错误页可能是瞬时抖动，留一点宽限；"账号已存在"是终局，等下去只是拖住整批。
+PAGE_ERROR_GENERIC_GRACE_SECONDS = 10.0
+
+
 def _page_error_label(state: dict) -> str:
     """区分 OpenAI 错误页类型：服务端临时错误 / 账号可能已存在 / 通用。"""
     url = str(state.get("url") or "").lower()
     title = str(state.get("title") or "").lower()
     text = str(state.get("bodyText") or "").lower()
     if any(k in text for k in ("route error", "invalid content type", "internal server", "server error", " 500", " 400")):
-        return "OpenAI 服务端临时错误"
+        return PAGE_ERROR_SERVER_TRANSIENT
     if any(k in url for k in ("signup", "create-account", "about-you")) or "signup" in title:
-        return "账号可能已存在"
+        return PAGE_ERROR_ACCOUNT_EXISTS
     return "OpenAI 错误页"
+
+
+def _page_error_grace(state: dict, configured_grace: float) -> float:
+    """OpenAI 错误页该给多长自动恢复宽限期（Cloudflare 不走这里）。
+
+    "账号可能已存在" 是终局：这一轮已经废了，再等 60 秒只是让批次白转一分钟；
+    服务端临时错误值得等满配置宽限；其余按通用短宽限处理。
+    """
+    label = _page_error_label(state)
+    if label == PAGE_ERROR_ACCOUNT_EXISTS:
+        return 0.0
+    if label == PAGE_ERROR_SERVER_TRANSIENT:
+        return configured_grace
+    return min(configured_grace, PAGE_ERROR_GENERIC_GRACE_SECONDS)
 
 
 async def _capture_registration_debug(page, tag: str) -> str:
@@ -990,6 +1010,7 @@ async def wait_for_phase(page, expected: str, timeout_s: float, stage: str, inte
     """
     deadline = asyncio.get_event_loop().time() + timeout_s
     challenge_deadline: float | None = None
+    active_grace = float(challenge_grace_s)
     challenge_seen = False
     last_state = None
     while asyncio.get_event_loop().time() < deadline:
@@ -1007,13 +1028,16 @@ async def wait_for_phase(page, expected: str, timeout_s: float, stage: str, inte
                 title = str(state.get("title") or "")
                 url = str(state.get("url") or "")[:120]
                 await _capture_registration_debug(page, f"challenge_{state['phase']}")
-                if challenge_grace_s > 0:
+                # 错误页按子类型决定宽限：账号已存在这类终局错误等下去没有意义
+                grace = challenge_grace_s if is_cf else _page_error_grace(state, challenge_grace_s)
+                if grace > 0:
                     emit_log(
                         f"[{'cf' if is_cf else 'page'}] 检测到{label} phase={state['phase']} title={title} url={url}；"
-                        f"等待自动恢复（宽限 {challenge_grace_s:.0f}s）",
+                        f"等待自动恢复（宽限 {grace:.0f}s）",
                         flush=True,
                     )
-                    challenge_deadline = asyncio.get_event_loop().time() + challenge_grace_s
+                    challenge_deadline = asyncio.get_event_loop().time() + grace
+                    active_grace = grace
                 else:
                     emit_log(f"[{'cf' if is_cf else 'page'}] 检测到{label} phase={state['phase']} title={title} url={url}；无宽限，立即判定失败", flush=True)
                     if is_cf:
@@ -1022,7 +1046,7 @@ async def wait_for_phase(page, expected: str, timeout_s: float, stage: str, inte
             if asyncio.get_event_loop().time() < challenge_deadline:
                 await asyncio.sleep(interval)
                 continue
-            emit_log(f"[{'cf' if is_cf else 'page'}] 宽限 {challenge_grace_s:.0f}s 耗尽仍停在{('挑战页' if is_cf else '错误页')}，判定失败", flush=True)
+            emit_log(f"[{'cf' if is_cf else 'page'}] 宽限 {active_grace:.0f}s 耗尽仍停在{('挑战页' if is_cf else '错误页')}，判定失败", flush=True)
             if is_cf:
                 raise CloudflareChallengeError(f"等待{expected}时")
             raise OpenAIErrorPageError(f"等待{expected}时（错误页在时限内未恢复）", label=_page_error_label(state))
@@ -1044,6 +1068,7 @@ async def wait_for_any_phase(page, expected_set, timeout_s: float, stage: str, i
     expected = tuple(expected_set)
     deadline = asyncio.get_event_loop().time() + timeout_s
     challenge_deadline: float | None = None
+    active_grace = float(challenge_grace_s)
     challenge_seen = False
     last_state = None
     while asyncio.get_event_loop().time() < deadline:
@@ -1061,13 +1086,15 @@ async def wait_for_any_phase(page, expected_set, timeout_s: float, stage: str, i
                 title = str(state.get("title") or "")
                 url = str(state.get("url") or "")[:120]
                 await _capture_registration_debug(page, f"challenge_{state['phase']}")
-                if challenge_grace_s > 0:
+                grace = challenge_grace_s if is_cf else _page_error_grace(state, challenge_grace_s)
+                if grace > 0:
                     emit_log(
                         f"[{'cf' if is_cf else 'page'}] 检测到{label} phase={state['phase']} title={title} url={url}；"
-                        f"等待自动恢复（宽限 {challenge_grace_s:.0f}s）",
+                        f"等待自动恢复（宽限 {grace:.0f}s）",
                         flush=True,
                     )
-                    challenge_deadline = asyncio.get_event_loop().time() + challenge_grace_s
+                    challenge_deadline = asyncio.get_event_loop().time() + grace
+                    active_grace = grace
                 else:
                     emit_log(f"[{'cf' if is_cf else 'page'}] 检测到{label} phase={state['phase']} title={title} url={url}；无宽限，立即判定失败", flush=True)
                     if is_cf:
@@ -1076,7 +1103,7 @@ async def wait_for_any_phase(page, expected_set, timeout_s: float, stage: str, i
             if asyncio.get_event_loop().time() < challenge_deadline:
                 await asyncio.sleep(interval)
                 continue
-            emit_log(f"[{'cf' if is_cf else 'page'}] 宽限 {challenge_grace_s:.0f}s 耗尽仍停在{('挑战页' if is_cf else '错误页')}，判定失败", flush=True)
+            emit_log(f"[{'cf' if is_cf else 'page'}] 宽限 {active_grace:.0f}s 耗尽仍停在{('挑战页' if is_cf else '错误页')}，判定失败", flush=True)
             if is_cf:
                 raise CloudflareChallengeError(f"等待{expected}时")
             raise OpenAIErrorPageError(f"等待{expected}时（错误页在时限内未恢复）", label=_page_error_label(state))

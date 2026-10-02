@@ -1,5 +1,6 @@
 """Clash Verge / Mihomo 控制器：每轮注册前切换 Selector 节点以更换出口 IP。"""
 import asyncio
+import random
 import time
 from collections import deque
 from urllib.parse import quote
@@ -27,6 +28,9 @@ SKIP_NAME_KEYWORDS = (
     "失败",
     "异常",
     "不可用",
+    # 供应商标注"不保障速度"的备用节点：能过 generate_204 体检（实测 221ms），但转发
+    # chatgpt.com 时整机不通。体检判据对它无效，只能按名字排除，否则每次抽中就是几分钟断流。
+    "备用",
     "官网",
     "订阅",
     "套餐",
@@ -87,6 +91,12 @@ def _max_delay_ms() -> int:
         return 0
 
 
+def _rotation_order() -> str:
+    """round_robin=按订阅顺序依次后移；random=每次在整池里随机挑。"""
+    order = str(getattr(settings, "clash_rotation_order", "round_robin") or "round_robin").strip().lower()
+    return order if order in ("round_robin", "random") else "round_robin"
+
+
 def _parse_region_keywords(raw: str | list[str] | None) -> list[str]:
     if raw is None:
         raw = str(getattr(settings, "clash_allowed_region_keywords", "") or "").strip()
@@ -97,6 +107,12 @@ def _parse_region_keywords(raw: str | list[str] | None) -> list[str]:
 
 def _region_keywords() -> list[str]:
     return _parse_region_keywords(None)
+
+
+def _extra_sync_groups() -> list[str]:
+    """必须和主组切到同一节点的其它代理组（逗号分隔的组名）。"""
+    raw = str(getattr(settings, "clash_rotate_extra_groups", "") or "")
+    return [name.strip() for name in raw.split(",") if name.strip()]
 
 
 def _oauth_region_keywords() -> list[str]:
@@ -198,6 +214,14 @@ def ordered_real_proxy_candidates(
         return candidates
     idx = candidates.index(now)
     return candidates[idx + 1:] + candidates[:idx + 1]
+
+
+def _unfiltered_candidates(proxies: dict[str, Any], selector_name: str) -> list[str]:
+    """忽略地区过滤的候选池，用于区分"关键词写错了"和"真的没有可用节点"。"""
+    try:
+        return ordered_real_proxy_candidates(proxies, selector_name, [], skip_unhealthy=False)
+    except ValueError:
+        return []
 
 
 def choose_next_proxy_name(proxies: dict[str, Any], selector_name: str) -> str:
@@ -449,7 +473,17 @@ def _selector_from_connections(
     votes = preferred or fallback
     if not votes:
         return ""
-    return max(set(votes), key=votes.count)
+    # max(set, key=count) 在票数打平时由字符串 hash 顺序决定，而 hash 顺序每个进程都
+    # 不同：两个 AI 域名各命中一个组时，主组/伴生组的角色会在重启后互换，表现为轮换
+    # 目标组飘忽不定。取票数最多者中最先出现的，保证同一次连接表读出同一结果。
+    best, best_count = "", -1
+    counts: dict[str, int] = {}
+    for name in votes:
+        counts[name] = counts.get(name, 0) + 1
+    for name in votes:
+        if counts[name] > best_count:
+            best, best_count = name, counts[name]
+    return best
 
 
 def _has_hint_connection(connections: list[dict[str, Any]], groups: set[str]) -> bool:
@@ -503,11 +537,17 @@ def _resolve_effective_selector(
     if mode != "rule":
         # global 模式由 GLOBAL 组接管；direct 模式由调用方提前跳过。
         return configured
+    groups = _policy_group_names(proxies)
+    # 显式配置且确实是策略组（不是 GLOBAL 这类策略名）时直接采信，不再反推。
+    # 反推依赖连接表，而 mihomo 会立刻移除已关闭的连接：空闲期表里根本没有 AI 域名连接，
+    # 多数票只会指向承接无关流量的兜底组（节点选择），于是把正确的配置否决掉，表现为
+    # "兜底组被切走、探测 IP 变了，但 OpenAI 出口纹丝不动"的假成功。
+    if configured in groups and configured not in SKIP_POLICY_NAMES:
+        return configured
     try:
         connections = curl_requests.get(f"{base}/connections", headers=headers, timeout=8).json().get("connections") or []
     except Exception:  # noqa: BLE001
         connections = []
-    groups = _policy_group_names(proxies)
     detected = _selector_from_connections(connections, groups)
     if not _has_hint_connection(connections, groups):
         # 表里没有 AI 域名连接时，多数投票结果可能是无关规则的组，必须实测确认。
@@ -604,23 +644,42 @@ def rotate_clash_proxy_sync(log=None, controller_url: str = "", selector_name: s
             skip_unhealthy=False,
         )
     except ValueError as exc:
-        _emit("✗", str(exc))
-        return {
-            "ok": False,
-            "skipped": False,
-            "selector": selector_name,
-            "before": before,
-            "after": before,
-            "before_ip": before_ip,
-            "ip": "",
-            "ip_changed": False,
-            "attempts": 0,
-            "skipped_nodes": [],
-            "error": str(exc),
-        }
+        # 订阅换名（例如 良心云 的 "|BGP|CUCM" 换成 suxins 的 "· Hysteria2"）会让
+        # 地区关键词静默 0 命中，轮换从此长期失效而日志只有"没有可切换的真实节点"。
+        # 池子里明明有真实节点时降级为不过滤，宁可换到别的地区也不要钉死在一个 IP 上。
+        fallback = _unfiltered_candidates(proxies, selector_name) if region_keywords else []
+        if not fallback:
+            _emit("✗", str(exc))
+            return {
+                "ok": False,
+                "skipped": False,
+                "selector": selector_name,
+                "before": before,
+                "after": before,
+                "before_ip": before_ip,
+                "ip": "",
+                "ip_changed": False,
+                "attempts": 0,
+                "skipped_nodes": [],
+                "error": str(exc),
+            }
+        _emit(
+            "⚠",
+            f"地区关键词 [{','.join(region_keywords)}] 在当前订阅 0 命中（订阅可能已换名），"
+            f"降级为不限制地区，从 {len(fallback)} 个真实节点中轮换",
+        )
+        ordered = fallback
 
     max_attempts = max(1, int(settings.clash_rotate_max_attempts or 1))
     settle = max(0.0, float(settings.clash_rotate_settle_seconds or 0))
+    if _rotation_order() == "random":
+        # 打乱在 _prefer_distinct_egress 之前：后者只把同 C 段的候选整体挪到队尾，
+        # 组内相对顺序沿用这里的乱序结果，两个目的都保住。
+        # 必须先剔除当前节点：round_robin 从"下一个"开始所以永远不会选中自己，而随机
+        # 会把当前节点也抽进来，结果"切换成功"却还在原节点上（回读判定 now==候选 会通过）。
+        if len(ordered) > 1:
+            ordered = [name for name in ordered if name != before] or ordered
+        random.shuffle(ordered)
     ordered = _prefer_distinct_egress(ordered, before_ip)
     after = before
     ip = ""
@@ -632,8 +691,14 @@ def rotate_clash_proxy_sync(log=None, controller_url: str = "", selector_name: s
     # chatgpt.com / auth.openai.com 可能被规则分到不同组，只切主组会出现
     # "本机 IP 变了、注册出口没变"，这些伴生组必须一起切。
     companions = _ai_companion_selectors(base, headers, proxies, selector_name) if mode == "rule" else []
+    # 显式声明要跟着一起切的组：主组只承载 AI 域名时，兜底组仍停在旧节点，出口 IP
+    # 看起来"没变"，轮换会被自己的 IP 校验判成失败。
+    companions = list(dict.fromkeys([
+        *companions,
+        *[name for name in _extra_sync_groups() if name != selector_name and isinstance(proxies.get(name), dict)],
+    ]))
     if companions:
-        _emit("·", f"OpenAI 流量还命中过这些组，一并切换: {','.join(companions)}")
+        _emit("·", f"需与主组保持同一节点的其它组，一并切换: {','.join(companions)}")
     for candidate in ordered[:max_attempts]:
         attempts += 1
         _emit("·", f"尝试 {attempts}/{max_attempts}: {candidate}")

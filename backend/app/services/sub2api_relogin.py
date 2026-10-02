@@ -90,9 +90,21 @@ async def _submit_login_form(page) -> bool:
 
 
 class Sub2APIReloginSkipped(RuntimeError):
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, evidence: str = ""):
         super().__init__(reason)
         self.reason = reason
+        # 判定依据原文。跳过本身不留截图，只看 reason 无法区分"账号真被封"和
+        # "页面样板文字误命中"，而这两种情况的处置完全相反。
+        self.evidence = evidence
+
+
+def _signal_window(signal: str, match: "re.Match | None", width: int = 90) -> str:
+    """截出命中词前后的片段，用于判断是真封禁还是页面样板文字误命中。"""
+    if not match:
+        return ""
+    start = max(0, match.start() - width)
+    text = re.sub(r"\s+", " ", str(signal)[start:match.end() + width])
+    return _safe_error(text, 260)
 
 
 def _safe_error(value: object, limit: int = 360) -> str:
@@ -471,10 +483,12 @@ async def capture_oauth_callback_from_profile(
                 except Exception:
                     body_text = ""
                 signal = f"{url} {body_text}"
-                if _PHONE_RE.search(signal):
-                    raise Sub2APIReloginSkipped("phone_second_verification")
-                if _TERMINAL_REMOTE_RE.search(signal):
-                    raise Sub2APIReloginSkipped("deactivated")
+                phone_hit = _PHONE_RE.search(signal)
+                if phone_hit:
+                    raise Sub2APIReloginSkipped("phone_second_verification", _signal_window(signal, phone_hit))
+                terminal_hit = _TERMINAL_REMOTE_RE.search(signal)
+                if terminal_hit:
+                    raise Sub2APIReloginSkipped("deactivated", _signal_window(signal, terminal_hit))
 
                 if not email_submitted:
                     email_filled = False

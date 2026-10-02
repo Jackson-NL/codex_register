@@ -10,5 +10,9 @@ from app.services import clash_verge
 
 
 @pytest.fixture(autouse=True)
-def _reset_region_keywords(monkeypatch):
+def _isolate_rotation_settings(monkeypatch):
     monkeypatch.setattr(clash_verge.settings, "clash_allowed_region_keywords", "")
+    # 生产 .env 把策略设为 random，而多数用例断言"切到第几个节点"，必须钉回顺序轮转。
+    monkeypatch.setattr(clash_verge.settings, "clash_rotation_order", "round_robin")
+    # 同理：生产 .env 会带上要同步切换的兜底组，会让"只切主组"的用例多出一次 PUT。
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_extra_groups", "")

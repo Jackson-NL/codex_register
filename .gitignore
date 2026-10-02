@@ -56,3 +56,11 @@ Thumbs.db
 
 # Internal design docs (not for public)
 docs/
+
+# Agent workspace instructions (not part of the project)
+Agents.md
+
+# Third-party / unrelated checkouts
+awesome-dsh-plugin/
+/scripts/
+repo-analysis/

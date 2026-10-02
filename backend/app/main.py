@@ -47,10 +47,21 @@ async def lifespan(app: FastAPI):
         reconciler.start()
     except Exception:
         reconciler = None
+    rotator = None
+    if settings.idle_proxy_rotation_enabled:
+        try:
+            from .services.proxy_rotation_scheduler import ProxyRotationScheduler
+
+            rotator = ProxyRotationScheduler()
+            rotator.start()
+        except Exception:
+            rotator = None
     app.state.registration_service = service
     try:
         yield
     finally:
+        if rotator:
+            await rotator.stop()
         if watchdog:
             await watchdog.stop()
         if reconciler:

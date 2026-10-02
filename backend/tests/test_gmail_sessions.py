@@ -369,9 +369,25 @@ def test_transient_upstream_failure_still_raises_502(monkeypatch):
     assert session.status == "active"
 
 
-def test_local_alias_ceiling_is_only_a_runaway_guard():
-    """上限已交给上游，本地值只防失控，必须明显高于常见订单的真实收码次数。"""
-    assert gmail_sessions.DEFAULT_MAX_ALIASES >= 10
+def test_local_alias_ceiling_is_a_configurable_risk_knob(monkeypatch):
+    """轮次上限 = "一个 base 邮箱最多出几个号"，必须能随配置调大调小。
+
+    旧断言（>=10）属于"本地值只是防失控兜底"的时代；现在它被当风控上限用（当前 5），
+    再钉一个下限会把"调小它"这个正常操作判成 bug。
+    """
+    from app.config import settings
+
+    assert gmail_sessions.DEFAULT_MAX_ALIASES == settings.smsbower_gmail_alias_ceiling
+    assert gmail_sessions.DEFAULT_MAX_ALIASES >= 1
+
+    # 新订单的默认轮次取的是当前配置，不是导入期常量（否则设置页改了不生效）
+    monkeypatch.setattr(settings, "smsbower_gmail_alias_ceiling", 3)
+    db = _db_session()
+    session = GmailSession(base_email="x@gmail.com", mail_id="m-x", alias_counter=0, status="active")
+    db.add(session)
+    db.commit()
+
+    assert session.max_aliases == 3
 
 
 def test_latest_finished_session_picks_newest_inactive_one():

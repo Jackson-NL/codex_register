@@ -6,7 +6,7 @@ import urllib.parse
 from ..config import settings
 from .console_logging import safe_console_print
 from .process_utils import hidden_subprocess_kwargs
-from .smsbower_keys import classify_key_failure, is_order_missing, key_pool, mask
+from .smsbower_keys import classify_key_failure, is_order_missing, key_pool, mask, record_key_failure
 
 BASE_URL = "https://smsbower.page/api/mail"
 REQUEST_TIMEOUT = 20
@@ -92,17 +92,17 @@ class SmsbowerMailClient:
             raise SmsbowerMailError("SMSBOWER_API_KEY 未配置（可在「系统设置 → 接码设置 → API Key 池」配置）")
         return self.api_key
 
-    def _key_for_request(self, action: str) -> str:
+    def _key_for_request(self, action: str, *, service: str = "") -> str:
         """新建订单每次换一把 Key；只读/管理类请求走本实例的兜底 Key。"""
         if action in NEW_ORDER_ACTIONS and not self._explicit_key:
-            return key_pool.acquire(f"new-order:{action}") or self._ensure_key()
+            return key_pool.acquire(f"new-order:{action}", service=service) or self._ensure_key()
         return self._ensure_key()
 
-    def _take_next_key(self, failed: str, tried: set[str]) -> str:
+    def _take_next_key(self, failed: str, tried: set[str], *, service: str = "") -> str:
         """换到池里下一把还没试过的 Key；返回空串表示没有可换的了。"""
         if self._explicit_key:
             return ""
-        nxt = key_pool.acquire("rotate", exclude={failed, *tried})
+        nxt = key_pool.acquire("rotate", exclude={failed, *tried}, service=service)
         if not nxt:
             return ""
         return nxt
@@ -145,7 +145,9 @@ class SmsbowerMailClient:
             return await self._request_for_order(action, order_id, params)
 
         is_new_order = action in NEW_ORDER_ACTIONS
-        key = self._key_for_request(action)
+        # mail 侧的 BANNED 同样是「Key × service」维度的临时封禁，不该冻结整把 Key
+        service = str(params.get("service") or "")
+        key = self._key_for_request(action, service=service)
         tried: set[str] = set()
         while True:
             payload = await self._request_with_key(action, key, params)
@@ -155,9 +157,9 @@ class SmsbowerMailClient:
                 key_pool.mark_success(key)
                 _bind_new_order_from_payload(payload, key)
                 return payload
-            key_pool.mark_failure(key, failure.reason, failure.cooldown)
+            record_key_failure(key, failure, service=service)
             tried.add(key)
-            nxt = self._take_next_key(failed=key, tried=tried)
+            nxt = self._take_next_key(failed=key, tried=tried, service=service)
             if not nxt:
                 raise SmsbowerMailError(f"API Key {mask(key)} 不可用（{failure.reason}）: {text[:160]}")
             if key == self.api_key:
@@ -179,7 +181,7 @@ class SmsbowerMailClient:
             # 绑定 Key 失效或该 Key 下没有这个订单 → 保留响应，继续扫描其它 Key。
             last_payload = payload
             if failure is not None:
-                key_pool.mark_failure(bound, failure.reason, failure.cooldown)
+                record_key_failure(bound, failure)
 
         for key in key_pool.key_chain(order_id):
             if key == bound:

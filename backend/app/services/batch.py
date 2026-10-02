@@ -28,17 +28,44 @@ GMAIL_NON_CONSUMING_REASONS = frozenset({
 })
 GMAIL_ALIAS_RETRY_DELAYS: tuple[float, ...] = (2.0, 5.0, 10.0)
 GMAIL_ALIAS_RETRYABLE_STATUS = frozenset({502, 503, 504})
-# 余额/库存/鉴权类失败重试必然还是失败，直接终止，不做无意义退避。
+# 上游无货是"等一等就有"，不是"等也没用"：以前它和余额/鉴权一起被归成 fatal 直接
+# 杀整批，结果 SMSBower 断货一分钟就要人工重开批次。现在单独一类，走退避等待。
+GMAIL_ALIAS_STOCK_OUT_HINTS = (
+    "no_activations",
+    "no_numbers",
+    "no_number",
+    "out of stock",
+    "no stock",
+    "empty set",
+    "无可用",
+    "无库存",
+    "没有可用",
+)
+# 这些是"等也不会变好"：余额见底、Key 失效或未配置。继续等待只会静默空转一小时，
+# 而且用户可能根本没发现，所以立即终止批次。
 GMAIL_ALIAS_FATAL_HINTS = (
     "insufficient_balance",
-    "no_activations",
+    "no_balance",
+    "no balance",
     "incorrect api key",
+    "bad_key",
     "ip_not_allowed",
     "no_access",
     "余额",
     "api key 未配置",
     "key 池中没有可用 key",
 )
+# 等待补货的退避阶梯：5s → 15s → 30s → 1m → 2m → 5m，之后固定每 5 分钟试一次。
+GMAIL_STOCK_BACKOFF_SECONDS: tuple[float, ...] = (5.0, 15.0, 30.0, 60.0, 120.0, 300.0)
+GMAIL_STOCK_BACKOFF_CAP_SECONDS = 300.0
+
+
+def _stock_backoff_seconds(attempt: int) -> float:
+    """第 N 次等待该睡多久（attempt 从 1 起）；超出阶梯后按最后一档封顶。"""
+    index = max(0, int(attempt) - 1)
+    if index < len(GMAIL_STOCK_BACKOFF_SECONDS):
+        return GMAIL_STOCK_BACKOFF_SECONDS[index]
+    return GMAIL_STOCK_BACKOFF_CAP_SECONDS
 
 
 def _alias_error_text(error: BaseException | None) -> str:
@@ -50,19 +77,27 @@ def _alias_error_text(error: BaseException | None) -> str:
     return f"{type(error).__name__}: {text[:200]}"
 
 
-def _is_retryable_alias_error(error: Exception) -> bool:
-    """判定 Gmail 取号失败值不值得重试。
+def _classify_alias_error(error: BaseException | None) -> str:
+    """取号失败三分类：fatal（立即停） / stock_out（等补货） / retry（瞬时故障）。
 
-    4xx 表示额度/会话状态（重试没有意义，且重复租号会真实扣费），只有上游
-    5xx 与网络类异常按偶发故障处理；余额/库存/鉴权类错误再快也是失败，跳过。
+    4xx 一般是额度或会话状态（重试没有意义，且重复租号会真实扣费），所以默认归 fatal；
+    只有上游 5xx 与网络类异常按偶发故障处理。无货单独一类，因为它等一等就有，
+    而余额/Key 类故障等一万年也不会好 —— 以前两者混在一起，断货一分钟就杀整批。
     """
     lowered = _alias_error_text(error).lower()
     if any(hint in lowered for hint in GMAIL_ALIAS_FATAL_HINTS):
-        return False
+        return "fatal"
+    if any(hint in lowered for hint in GMAIL_ALIAS_STOCK_OUT_HINTS):
+        return "stock_out"
     status = getattr(error, "status_code", None)
     if status is None:
-        return True
-    return int(status or 0) in GMAIL_ALIAS_RETRYABLE_STATUS
+        return "retry"
+    return "retry" if int(status or 0) in GMAIL_ALIAS_RETRYABLE_STATUS else "fatal"
+
+
+def _is_retryable_alias_error(error: Exception) -> bool:
+    """是否值得再试一次（含等补货）。保留给旧调用与测试。"""
+    return _classify_alias_error(error) != "fatal"
 
 
 def normalize_batch_concurrency(requested: int, service_capacity: int, gmail_mode: bool = False) -> int:
@@ -534,33 +569,64 @@ async def _next_gmail_alias(db, log=None) -> tuple[str, str, dict]:
         f"after={proxy_rotation.get('after') or '?'} ip={proxy_rotation.get('ip') or '?'}"
     )
 
-    total_attempts = len(GMAIL_ALIAS_RETRY_DELAYS) + 1
     item: dict | None = None
     order_action = ""
-    last_error: Exception | None = None
-    for attempt in range(1, total_attempts + 1):
+    transient_attempt = 0
+    stock_attempt = 0
+    stock_waited = 0.0
+    stock_cap = max(0, int(settings.gmail_stock_wait_max_minutes or 0)) * 60.0
+    cap_text = "无限" if not stock_cap else f"{stock_cap / 60:g} 分钟"
+    while True:
         try:
             item, order_action = await _acquire_gmail_alias(db, log)
-            last_error = None
-            if attempt > 1:
-                log(f"[gmail] ✓ 第 {attempt}/{total_attempts} 次尝试取号成功")
+            if transient_attempt or stock_attempt:
+                log(
+                    f"[gmail] ✓ 恢复取号成功（瞬时重试 {transient_attempt} 次 / "
+                    f"等待补货 {stock_attempt} 次，累计等待 {stock_waited:.0f}s）"
+                )
             break
         except Exception as error:  # noqa: BLE001
-            if not _is_retryable_alias_error(error):
-                log(f"[gmail] ✗ 取号失败且不可重试：{_alias_error_text(error)}")
+            kind = _classify_alias_error(error)
+            if kind == "fatal":
+                log(f"[gmail] ✗ 取号失败且不可恢复：{_alias_error_text(error)}")
                 raise
-            last_error = error
-            if attempt < total_attempts:
-                delay = GMAIL_ALIAS_RETRY_DELAYS[attempt - 1]
+            if kind == "stock_out":
+                # 上游能正常应答只是没货，说明链路本身是好的：重置瞬时计数，避免把断货
+                # 期间的偶发抖动累计成"连续失败"而误杀整批。
+                transient_attempt = 0
+                stock_attempt += 1
+                delay = _stock_backoff_seconds(stock_attempt)
+                if stock_cap and stock_waited + delay > stock_cap:
+                    log(
+                        f"[gmail] ✗ 等待补货超时：已等 {stock_waited:.0f}s / 上限 {cap_text}，"
+                        f"最后错误：{_alias_error_text(error)}"
+                    )
+                    raise TimeoutError(
+                        f"等待 Gmail 订单补货超时（已等 {stock_waited:.0f}s / 上限 {cap_text}）："
+                        f"{_alias_error_text(error)}"
+                    ) from error
+                stock_waited += delay
                 log(
-                    f"[gmail] ⚠️ 第 {attempt}/{total_attempts} 次取号失败："
-                    f"{_alias_error_text(error)}；{delay:g} 秒后重试"
+                    f"[gmail] ⚠️ 上游无货，等待补货中（第 {stock_attempt} 次 / 已等 "
+                    f"{stock_waited:.0f}s / 上限 {cap_text}）：{_alias_error_text(error)}；"
+                    f"{delay:g} 秒后重试"
                 )
                 await asyncio.sleep(delay)
+                continue
+            transient_attempt += 1
+            if transient_attempt > len(GMAIL_ALIAS_RETRY_DELAYS):
+                log(
+                    f"[gmail] ✗ 连续 {transient_attempt} 次瞬时故障，终止本批："
+                    f"{_alias_error_text(error)}"
+                )
+                raise
+            delay = GMAIL_ALIAS_RETRY_DELAYS[transient_attempt - 1]
+            log(
+                f"[gmail] ⚠️ 第 {transient_attempt}/{len(GMAIL_ALIAS_RETRY_DELAYS) + 1} 次取号失败："
+                f"{_alias_error_text(error)}；{delay:g} 秒后重试"
+            )
+            await asyncio.sleep(delay)
 
-    if item is None:
-        log(f"[gmail] ✗ 连续 {total_attempts} 次取号失败，终止本批：{_alias_error_text(last_error)}")
-        raise last_error or RuntimeError("Gmail 取号失败")
     meta = {
         "gmail_session_id": item.get("session_id"),
         "gmail_base_email": item.get("base_email", ""),

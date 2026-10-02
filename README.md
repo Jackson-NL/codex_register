@@ -117,9 +117,11 @@ codex_register/
 │  │  │  ├─ registrations.py  注册任务
 │  │  │  ├─ batches.py        批量注册
 │  │  │  ├─ accounts.py       账号管理 + Codex OAuth 批量重授权
+│  │  │  ├─ admin.py          管理员登录/会话
 │  │  │  ├─ sub2api.py        Sub2API 上传
 │  │  │  ├─ sub2api_relogin.py 异常账号重登
 │  │  │  ├─ link_extraction.py 提链工作台
+│  │  │  ├─ mail_config.py    邮箱 Provider 配置
 │  │  │  └─ ...
 │  │  └─ services/            核心业务
 │  │     ├─ registrator.py     注册执行器（邮箱+手机号双路径）
@@ -129,12 +131,21 @@ codex_register/
 │  │     ├─ cf_layer.py        Cloudflare Turnstile 处理
 │  │     ├─ smsbower.py        SMS 接码
 │  │     ├─ smsbower_mail.py   SMSBower 临时 Gmail
+│  │     ├─ smsbower_keys.py   接码多 Key 池（订单级绑定）
+│  │     ├─ mail_pool.py       自定义邮箱池租约/分配
+│  │     ├─ pool_reconciler.py 邮箱池后台收敛（租约回收/低水位）
+│  │     ├─ oauth_policy.py    Codex OAuth 并发/冷却策略
 │  │     ├─ sub2api.py         Sub2API 上传客户端
 │  │     ├─ sub2api_relogin.py 异常账号重登
 │  │     ├─ clash_verge.py     Clash 代理轮换
+│  │     ├─ proxy_rotation_scheduler.py 空闲期定时换节点
+│  │     ├─ process_watchdog.py 浏览器孤儿进程清理
+│  │     ├─ profile_lifecycle.py profile 生命周期/清理
 │  │     ├─ link_extraction.py 提链任务编排
+│  │     ├─ link_browser.py / link_proxies.py 提链浏览器/出口轮换
 │  │     ├─ payment_link_extractor/  CS/OAICS Checkout、Stripe 支付链接提取
-│  │     └─ mail_providers/    邮箱 Provider（CF临时邮箱 / Outlook）
+│  │     ├─ mail_providers/    邮箱 Provider（CF临时邮箱 / Outlook）
+│  │     └─ http_client.py / debug_capture.py / console_logging.py 等工具层
 │  ├─ scripts/                独立运维脚本（RT 批量刷新/OAuth 登录诊断等）
 │  ├─ tests/                  pytest 测试
 │  ├─ data/                   SQLite 数据库（不入库）
@@ -157,7 +168,7 @@ codex_register/
 
 | 前缀 | 模块 | 功能 |
 |---|---|---|
-| `/api/registrations` | registrations | 注册任务管理与调试 |
+| `/api/registrations` | registrations | 注册任务管理与调试（含 HAR/截图抓取） |
 | `/api/batches` | batches | 批量注册 |
 | `/api/accounts` | accounts | 账号 CRUD / 标签 / 导入导出 / Codex OAuth 批量任务 |
 | `/api/gmail-sessions` | gmail_sessions | SMSBower 临时 Gmail 会话 |
@@ -166,7 +177,8 @@ codex_register/
 | `/api/link-extraction` | link_extraction | Checkout 支付链接提取 |
 | `/api/proxies` | proxies | 代理池管理 |
 | `/api/settings` | settings | 运行时配置读写 |
-| `/api/mail-config` | mail_config | 邮箱 Provider 配置 |
+| `/api/mail-config` | mail_config | 邮箱 Provider 配置（CF 临时邮箱 / Outlook / 自定义邮箱池） |
+| `/api/admin` | admin | 管理员登录与会话（可选，`ADMIN_AUTH_ENABLED` 开启） |
 | `/api/stats` | stats | 仪表盘统计 |
 | `/api/tasks` | tasks | 任务查询 |
 
@@ -178,11 +190,14 @@ codex_register/
 | `registrations` | 注册任务（状态、日志、结果、邮箱来源）|
 | `batches` | 批量注册任务 |
 | `gmail_sessions` | SMSBower 临时 Gmail 会话（别名复用）|
+| `custom_mailboxes` | 自定义邮箱池（租约/回收/凭据快照状态机）|
 | `sub2api_relogin_jobs` / `sub2api_relogin_items` | 重登任务及子项 |
 | `account_sub2api_uploads` | 账号在 Sub2API 各分组的状态 |
 | `link_extraction_jobs` / `link_extraction_items` | 提链任务、账号阶段和支付链接结果 |
 | `proxies` | 代理池 |
 | `oauth_logs` | OAuth 日志持久化 |
+| `tasks` / `sms_activations` | 早期短信任务模型（兼容保留）|
+| `health_checks` | 账号健康检查记录 |
 | `ui_settings` | 前端设置 JSON |
 
 旧数据库启动时自动 `ALTER TABLE` 补齐新字段，无需手动迁移。
@@ -221,8 +236,9 @@ npm run build
 - 后端**不要**使用 `--reload` 启动，浏览器自动化和 Gmail 子进程需要稳定的事件循环。
 - 日志默认以明文存储（含密码/验证码/TOTP），便于排查。可通过 API `POST /api/registrations/log-redact` 临时开启脱敏。
 - SQLite 单机部署，并发写入有限。`check_same_thread=False` + `timeout=10` 已设置，但高并发下仍可能锁库。
-- API 当前无鉴权，CORS 全开（`allow_origins=["*"]`），仅适用于本地内网环境，不要暴露到公网。
+- API 默认无鉴权、CORS 全开（`allow_origins=["*"]`），仅适用于本地内网环境，不要暴露到公网。如需简单保护，可设置 `ADMIN_AUTH_ENABLED=true` + `ADMIN_ACCESS_KEY` 启用管理员登录（覆盖管理页与敏感接口）。
 - `data/`、`profiles/`、`.env`、`output/` 均已在 `.gitignore` 中排除，请勿提交到公共仓库。
+- `backend/data/debug_har`（调试 trace）与 `backend/data/oauth_debug`（失败截图）会随注册任务持续累积，属可删除的调试产物，定期清理可释放磁盘。
 
 ## 📄 免责声明
 

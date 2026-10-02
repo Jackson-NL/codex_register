@@ -21,14 +21,19 @@ class Settings(BaseSettings):
     smsbower_service: str = "dr"
     smsbower_country: int = 73
     smsbower_max_price: float = 0.034
-    # 同一个 Gmail 订单本地允许复用的最大轮次。真实上限由 SMSBower 决定
-    # （getStatus.available_to_get_next_code / setStatus=5 的耗尽报错），这里只作
-    # 防失控兜底：避免上游异常时协调器在同一订单上无限循环取号。
-    smsbower_gmail_alias_ceiling: int = 15
+    # 同一个 Gmail 订单允许复用几轮（每轮注册一个号）。这是"一个 base 邮箱最多出几个号"
+    # 的风控上限，不是防失控兜底：真实可收码次数由 SMSBower 决定（getStatus
+    # .available_to_get_next_code / setStatus=5 的耗尽报错），本地值更低时以本地为准。
+    # 注意是软上限：邮箱验证前失败的轮次会被 extend_for_pre_verification_failure 回补
+    # 一位（15 变 18 就是这么来的），实际可能略高于此值。
+    smsbower_gmail_alias_ceiling: int = 5
     smsbower_timeout: int = 20
     smsbower_poll_interval: int = 4
     smsbower_poll_timeout: int = 120
     smsbower_mail_ttl_minutes: int = 20
+    # 上游无货（no_activations 等）时最长等多久再放弃整批；0 = 无限等。
+    # 断货是常态，以前直接杀批次要人工重开，所以走退避等待（5/15/30/60/120/300 秒）。
+    gmail_stock_wait_max_minutes: int = 60
 
     registration_country_iso: str = "BR"
     registration_country_dialing_code: str = "55"
@@ -47,6 +52,11 @@ class Settings(BaseSettings):
     clash_selector_name: str = "良心云"
     clash_rotate_settle_seconds: float = 1.5
     clash_rotate_max_attempts: int = 12
+    # 节点选择策略：round_robin=按订阅列表顺序依次后移（可预测、便于复现）；
+    # random=每次在候选池里随机挑，出口 IP 序列没有固定周期。
+    clash_rotation_order: str = "round_robin"
+    # 与主组一起切到同一节点的其它代理组（逗号分隔组名）。用于"整台机器出口一致换 IP"。
+    clash_rotate_extra_groups: str = ""
     # 轮换时在「良心云」Selector 下只切换名称含这些关键词的节点（逗号分隔，留空=不限制）。
     # 当前节点命名为 emoji+中文，如 🇯🇵日本高速01 / 🇸🇬新加坡高速01，故用 日本,新加坡。
     clash_allowed_region_keywords: str = ""
@@ -62,6 +72,16 @@ class Settings(BaseSettings):
     oauth_clash_allowed_region_keywords: str = ""
     # OAuth 启动前的 Clash 轮换最多等待多久，避免任务永久停在准备阶段。
     oauth_clash_rotate_timeout_seconds: float = 30.0
+    # 空闲期定时轮换：OAuth job 只在启动时换一次节点，之后长时间钉在同一出口 IP。
+    # 开启后由后台调度器每 min~max 分钟随机换一次，OAuth job 在途时自动跳过。
+    idle_proxy_rotation_enabled: bool = False
+    idle_proxy_rotation_min_minutes: float = 5.0
+    idle_proxy_rotation_max_minutes: float = 30.0
+    # OAuth job 在途时是否仍然换节点。True = 跑任务的过程中持续换出口 IP；
+    # False = 只在 job 空闲期换（同一次授权绝不跨出口 IP）。
+    idle_proxy_rotation_during_oauth: bool = True
+    # 空闲轮换的独立超时：整池随机可能要连测多个节点，复用 OAuth job 的 30s 会被掐断。
+    idle_proxy_rotation_timeout_seconds: float = 120.0
     # 长时间运行负载控制：OAuth 日志批量写库，避免每行日志创建线程和 SQLite 写事务。
     oauth_log_flush_interval_seconds: float = 1.0
     oauth_log_flush_batch_size: int = 50

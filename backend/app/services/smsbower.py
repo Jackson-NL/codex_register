@@ -5,7 +5,7 @@ import urllib.parse
 from ..config import settings
 from .console_logging import safe_console_print
 from .process_utils import hidden_subprocess_kwargs
-from .smsbower_keys import classify_key_failure, is_order_missing, key_pool, mask
+from .smsbower_keys import classify_key_failure, is_order_missing, key_pool, mask, record_key_failure
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0"
 PROXY = "http://127.0.0.1:7890"
@@ -85,11 +85,14 @@ class SmsbowerClient:
                 return bound
         return self._ensure_key()
 
-    def _take_next_key(self, failed: str, tried: set[str]) -> str:
-        """换到池里下一把还没试过的 Key；返回空串表示没有可换的了。"""
+    def _take_next_key(self, failed: str, tried: set[str], *, service: str = "", country: str = "") -> str:
+        """换到池里下一把还没试过的 Key；返回空串表示没有可换的了。
+
+        带上 service/country，轮换时会跳过该国家已经封禁这把 Key 的组合。
+        """
         if self._explicit_key:
             return ""
-        nxt = key_pool.acquire("rotate", exclude={failed, *tried})
+        nxt = key_pool.acquire("rotate", exclude={failed, *tried}, service=service, country=country)
         if not nxt:
             return ""
         return nxt
@@ -132,6 +135,8 @@ class SmsbowerClient:
             return await self._get_order_scoped(action, order_id, params)
 
         key = api_key or self._key_for_order(order_id)
+        service = str(params.get("service") or "")
+        country = str(params.get("country") or "")
         tried: set[str] = set()
         while True:
             text = await self._fetch(action, key, params)
@@ -139,13 +144,13 @@ class SmsbowerClient:
             if failure is None:
                 key_pool.mark_success(key)
                 return text
-            key_pool.mark_failure(key, failure.reason, failure.cooldown)
+            record_key_failure(key, failure, service=service, country=country)
             # 订单请求换 Key 只会查到别人的订单，必须直接报错；
             # 订单无关的只读请求（余额 / 价格 / 国家列表）才允许换 Key 重试。
             if order_id:
                 raise SmsbowerError(f"API Key {mask(key)} 不可用（{failure.reason}）: {text[:120]}")
             tried.add(key)
-            nxt = self._take_next_key(failed=key, tried=tried)
+            nxt = self._take_next_key(failed=key, tried=tried, service=service, country=country)
             if not nxt:
                 raise SmsbowerError(f"API Key {mask(key)} 不可用（{failure.reason}）: {text[:120]}")
             if key == self.api_key:
@@ -166,7 +171,7 @@ class SmsbowerClient:
             last_text = text
             failure = classify_key_failure(text)
             if failure is not None:
-                key_pool.mark_failure(key, failure.reason, failure.cooldown)
+                record_key_failure(key, failure)
                 raise SmsbowerError(f"API Key {mask(key)} 不可用（{failure.reason}）: {text[:120]}")
             if is_order_missing(text):
                 continue
@@ -179,8 +184,17 @@ class SmsbowerClient:
         return last_text
 
     async def _get_new_order(self, action: str, **params) -> str:
-        """新建订单请求：每次从 Key 池取下一把 Key，并在拿到订单号后立即绑定。"""
-        key = self._ensure_key() if self._explicit_key else (key_pool.acquire(f"new-order:{action}") or self._ensure_key())
+        """新建订单请求：每次从 Key 池取下一把 Key，并在拿到订单号后立即绑定。
+
+        getNumber 的 `BANNED:<时间戳>` 是「这把 Key × 这个国家/供应商」维度的响应，
+        所以按 service+country 记账而不是冻整把 Key —— 否则池里两把 Key 会退化成一把。
+        """
+        service = str(params.get("service") or "")
+        country = str(params.get("country") or "")
+        if self._explicit_key:
+            key = self._ensure_key()
+        else:
+            key = key_pool.acquire(f"new-order:{action}", service=service, country=country) or self._ensure_key()
         tried: set[str] = set()
         while True:
             text = await self._fetch(action, key, params)
@@ -189,11 +203,14 @@ class SmsbowerClient:
                 key_pool.mark_success(key)
                 _bind_new_order_from_response(text, key)
                 return text
-            key_pool.mark_failure(key, failure.reason, failure.cooldown)
+            record_key_failure(key, failure, service=service, country=country)
             tried.add(key)
-            nxt = self._take_next_key(failed=key, tried=tried)
+            nxt = self._take_next_key(failed=key, tried=tried, service=service, country=country)
             if not nxt:
-                raise SmsbowerError(f"API Key {mask(key)} 不可用（{failure.reason}）: {text[:120]}")
+                raise SmsbowerError(
+                    f"API Key {mask(key)} 在 country={country or '?'} service={service or '?'} 上不可用"
+                    f"（{failure.reason}）: {text[:120]}"
+                )
             self._log_rotation(key, nxt, failure.reason, new_order=True)
             key = nxt
 

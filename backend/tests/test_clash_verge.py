@@ -834,3 +834,246 @@ def test_companion_ai_group_switched_together_with_primary(monkeypatch):
     assert result["ok"] is True
     assert switched == [("节点选择", "✨ 美国02"), ("AI 服务", "✨ 美国02")]
     assert any("一并切换" in m and "AI 服务" in m for m in logs)
+
+
+def test_region_keyword_miss_falls_back_to_unfiltered_pool(monkeypatch):
+    """订阅换名让地区关键词 0 命中时降级为不限制，而不是放弃轮换（否则 IP 长期钉死）。"""
+    proxies_payload = {
+        "proxies": {
+            "良心云": {"type": "Selector", "now": "🇯🇵日本专线01", "all": ["🇯🇵日本专线01", "🇺🇸美国高速01"]},
+            "🇯🇵日本专线01": {"type": "Vless", "history": [{"delay": 100}]},
+            "🇺🇸美国高速01": {"type": "Trojan", "history": [{"delay": 100}]},
+        }
+    }
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/proxies"):
+            return _Resp(payload=proxies_payload)
+        if "/delay" in url:
+            return _Resp(payload={"delay": 50})
+        raise AssertionError(url)
+
+    switched = []
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_enabled", True)
+    monkeypatch.setattr(clash_verge.settings, "clash_controller_url", "http://127.0.0.1:9098")
+    monkeypatch.setattr(clash_verge.settings, "clash_selector_name", "良心云")
+    monkeypatch.setattr(clash_verge.settings, "clash_allowed_region_keywords", "顶级")
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_max_attempts", 2)
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_settle_seconds", 0)
+    monkeypatch.setattr(clash_verge, "_get_exit_ip", _exit_ip_switching("9.9.9.9"))
+    monkeypatch.setattr(clash_verge.curl_requests, "get", fake_get)
+    monkeypatch.setattr(clash_verge, "_switch_selector", lambda base, selector, node, headers: switched.append(node))
+    monkeypatch.setattr(clash_verge, "_close_connections", lambda *a, **kw: None)
+    monkeypatch.setattr(clash_verge, "_RECENT_EXIT_IPS", deque())
+    monkeypatch.setattr(clash_verge, "_NODE_EXIT_IP", {})
+
+    logs = []
+    result = clash_verge.rotate_clash_proxy_sync(log=logs.append)
+
+    assert result["ok"] is True
+    assert switched == ["🇺🇸美国高速01"]
+    assert any("0 命中" in m and "降级" in m for m in logs)
+
+
+def test_region_keyword_miss_without_any_real_node_still_fails(monkeypatch):
+    """回退只兜"关键词写错"，真的没有可用节点时必须照原样报错，不能假装轮换成功。"""
+    proxies_payload = {
+        "proxies": {
+            "良心云": {"type": "Selector", "now": "DIRECT", "all": ["DIRECT"]},
+            "DIRECT": {"type": "Dict"},
+        }
+    }
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/proxies"):
+            return _Resp(payload=proxies_payload)
+        raise AssertionError(url)
+
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_enabled", True)
+    monkeypatch.setattr(clash_verge.settings, "clash_controller_url", "http://127.0.0.1:9098")
+    monkeypatch.setattr(clash_verge.settings, "clash_selector_name", "良心云")
+    monkeypatch.setattr(clash_verge.settings, "clash_allowed_region_keywords", "顶级")
+    monkeypatch.setattr(clash_verge, "_get_exit_ip", lambda *a: "1.1.1.1")
+    monkeypatch.setattr(clash_verge.curl_requests, "get", fake_get)
+
+    logs = []
+    result = clash_verge.rotate_clash_proxy_sync(log=logs.append)
+
+    assert result["ok"] is False
+    assert "没有可切换的真实节点" in result["error"]
+    assert not any("降级" in m for m in logs)
+
+
+def test_random_rotation_order_drives_node_selection(monkeypatch):
+    """CLASH_ROTATION_ORDER=random 时，选谁由乱序结果决定，而不是订阅列表的下一个。"""
+    members = [f"node-{i}" for i in range(8)]
+    proxies_payload = {
+        "proxies": {
+            "AI 服务": {"type": "Selector", "now": "node-0", "all": members},
+            **{name: {"type": "Vless", "history": [{"delay": 100}]} for name in members},
+        }
+    }
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/proxies"):
+            return _Resp(payload=proxies_payload)
+        if "/delay" in url:
+            return _Resp(payload={"delay": 50})
+        raise AssertionError(url)
+
+    shuffled = []
+
+    def fake_shuffle(items):
+        shuffled.append(list(items))
+        items[:] = ["node-5"] + [name for name in items if name != "node-5"]
+
+    switched = []
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_enabled", True)
+    monkeypatch.setattr(clash_verge.settings, "clash_controller_url", "http://127.0.0.1:9090")
+    monkeypatch.setattr(clash_verge.settings, "clash_selector_name", "AI 服务")
+    monkeypatch.setattr(clash_verge.settings, "clash_rotation_order", "random")
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_max_attempts", 1)
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_settle_seconds", 0)
+    monkeypatch.setattr(clash_verge, "_get_exit_ip", _exit_ip_switching("9.9.9.9"))
+    monkeypatch.setattr(clash_verge.curl_requests, "get", fake_get)
+    monkeypatch.setattr(clash_verge.random, "shuffle", fake_shuffle)
+    monkeypatch.setattr(clash_verge, "_switch_selector", lambda base, selector, node, headers: switched.append(node))
+    monkeypatch.setattr(clash_verge, "_close_connections", lambda *a, **kw: None)
+
+    result = clash_verge.rotate_clash_proxy_sync()
+
+    assert result["ok"] is True
+    assert switched == ["node-5"]
+    # 送进乱序的池子必须排除当前节点（node-0），8 个成员只剩 7 个候选。
+    assert len(shuffled) == 1 and len(shuffled[0]) == 7
+    assert "node-0" not in shuffled[0]
+
+
+def test_random_order_never_selects_the_current_node(monkeypatch):
+    """随机模式不能抽中当前节点，否则"切换成功"其实一格没动（回读判定会通过）。"""
+    members = ["node-0", "node-1", "node-2", "node-3"]
+    proxies_payload = {
+        "proxies": {
+            "AI 服务": {"type": "Selector", "now": "node-0", "all": members},
+            **{name: {"type": "Vless", "history": [{"delay": 100}]} for name in members},
+        }
+    }
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/proxies"):
+            return _Resp(payload=proxies_payload)
+        if "/delay" in url:
+            return _Resp(payload={"delay": 50})
+        raise AssertionError(url)
+
+    switched = []
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_enabled", True)
+    monkeypatch.setattr(clash_verge.settings, "clash_controller_url", "http://127.0.0.1:9090")
+    monkeypatch.setattr(clash_verge.settings, "clash_selector_name", "AI 服务")
+    monkeypatch.setattr(clash_verge.settings, "clash_rotation_order", "random")
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_max_attempts", 1)
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_settle_seconds", 0)
+    monkeypatch.setattr(clash_verge, "_get_exit_ip", _exit_ip_switching("9.9.9.9"))
+    monkeypatch.setattr(clash_verge.curl_requests, "get", fake_get)
+    # 故意倒序：若当前节点仍在抽签池里，它会被排到第一位而被选中。
+    monkeypatch.setattr(clash_verge.random, "shuffle", lambda items: items.reverse())
+    monkeypatch.setattr(clash_verge, "_switch_selector", lambda base, selector, node, headers: switched.append(node))
+    monkeypatch.setattr(clash_verge, "_close_connections", lambda *a, **kw: None)
+
+    result = clash_verge.rotate_clash_proxy_sync()
+
+    assert result["ok"] is True
+    assert switched and switched[0] != "node-0"
+
+
+def test_extra_sync_group_follows_primary_node(monkeypatch):
+    """主组只承接 AI 域名时，兜底组不跟着切就会出现"切成功了但 IP 没变"的误判。"""
+    members = ["✨ 美国01", "✨ 美国02"]
+    payload = {"proxies": {
+        "✨ 美国01": {"type": "Vless"},
+        "✨ 美国02": {"type": "Vless"},
+        "AI 服务": {"type": "Selector", "all": members, "now": "✨ 美国01"},
+        "节点选择": {"type": "Selector", "all": members, "now": "✨ 美国01"},
+    }}
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/configs"):
+            return _Resp({"mode": "rule"})
+        if url.endswith("/proxies"):
+            return _Resp(payload)
+        if url.endswith("/connections"):
+            return _Resp({"connections": []})
+        if "/delay" in url:
+            return _Resp({"delay": 200})
+        raise AssertionError(url)
+
+    switched = []
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_enabled", True)
+    monkeypatch.setattr(clash_verge.settings, "clash_controller_url", "http://127.0.0.1:9090")
+    monkeypatch.setattr(clash_verge.settings, "clash_selector_name", "AI 服务")
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_extra_groups", "节点选择")
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_max_attempts", 1)
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_settle_seconds", 0)
+    monkeypatch.setattr(clash_verge, "_get_exit_ip", _exit_ip_switching("8.8.8.8"))
+    monkeypatch.setattr(clash_verge.curl_requests, "get", fake_get)
+    monkeypatch.setattr(clash_verge, "_switch_selector", lambda base, selector, node, headers: switched.append((selector, node)))
+    monkeypatch.setattr(clash_verge, "_close_connections", lambda *a, **kw: None)
+
+    logs = []
+    result = clash_verge.rotate_clash_proxy_sync(log=logs.append)
+
+    assert result["ok"] is True
+    assert switched == [("AI 服务", "✨ 美国02"), ("节点选择", "✨ 美国02")]
+    assert any("一并切换" in m and "节点选择" in m for m in logs)
+
+
+def test_explicit_selector_not_overridden_by_connection_majority(monkeypatch):
+    """显式配了真实策略组时，不能被无关流量的多数票否决成兜底组。
+
+    空闲期连接表里没有 AI 域名连接（mihomo 立刻移除已关闭连接），多数票会指向承接
+    兜底流量的 节点选择；照旧逻辑会把 AI 服务 换掉，于是切了兜底组、AI 出口纹丝不动。
+    """
+    members = ["✨ 美国01", "✨ 美国02"]
+    payload = {"proxies": {
+        "✨ 美国01": {"type": "Vless"},
+        "✨ 美国02": {"type": "Vless"},
+        "AI 服务": {"type": "Selector", "all": members, "now": "✨ 美国01"},
+        "节点选择": {"type": "Selector", "all": members, "now": "✨ 美国01"},
+        "GLOBAL": {"type": "Selector", "all": members, "now": "✨ 美国01"},
+    }}
+    conns = {"connections": [
+        {"metadata": {"host": "www.google.com"}, "chains": ["✨ 美国01", "节点选择"]},
+        {"metadata": {"host": "cdn.jsdelivr.net"}, "chains": ["✨ 美国01", "节点选择"]},
+        {"metadata": {"host": "t.me"}, "chains": ["✨ 美国01", "节点选择"]},
+    ]}
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/configs"):
+            return _Resp({"mode": "rule"})
+        if url.endswith("/proxies"):
+            return _Resp(payload)
+        if url.endswith("/connections"):
+            return _Resp(conns)
+        if "/delay" in url:
+            return _Resp({"delay": 200})
+        return _Resp({})
+
+    switched = []
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_enabled", True)
+    monkeypatch.setattr(clash_verge.settings, "clash_controller_url", "http://127.0.0.1:9090")
+    monkeypatch.setattr(clash_verge.settings, "clash_selector_name", "AI 服务")
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_max_attempts", 1)
+    monkeypatch.setattr(clash_verge.settings, "clash_rotate_settle_seconds", 0)
+    monkeypatch.setattr(clash_verge, "_get_exit_ip", _exit_ip_switching("8.8.8.8"))
+    monkeypatch.setattr(clash_verge.curl_requests, "get", fake_get)
+    monkeypatch.setattr(clash_verge, "_switch_selector", lambda base, selector, node, headers: switched.append((selector, node)))
+    monkeypatch.setattr(clash_verge, "_close_connections", lambda *a, **kw: None)
+    monkeypatch.setattr(clash_verge, "_NODE_EXIT_IP", {})
+    monkeypatch.setattr(clash_verge, "_RECENT_EXIT_IPS", deque())
+
+    logs = []
+    result = clash_verge.rotate_clash_proxy_sync(log=logs.append)
+
+    assert result["ok"] is True
+    assert switched == [("AI 服务", "✨ 美国02")]
+    assert not any("改用实测代理组" in m for m in logs)

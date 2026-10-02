@@ -376,7 +376,7 @@ def test_next_gmail_alias_retries_transient_upstream_failure(monkeypatch):
     assert calls == ["alias", "alias"]
     assert "rent" not in calls  # active 订单仍有剩余，重试不得再租一次
     assert any("第 1/4 次取号失败" in m and "秒后重试" in m for m in messages)
-    assert any("第 2/4 次尝试取号成功" in m for m in messages)
+    assert any("恢复取号成功" in m and "瞬时重试 1 次" in m for m in messages)
     assert not any("终止本批" in m for m in messages)
 
 
@@ -399,8 +399,9 @@ def test_next_gmail_alias_stops_batch_after_exhausting_retries(monkeypatch):
         asyncio.run(batch_service._next_gmail_alias(db, log=messages.append))
 
     assert len(calls) == 4
-    assert sum("次取号失败" in m for m in messages) == 4
-    assert any("连续 4 次取号失败，终止本批" in m for m in messages)
+    # 前 3 次各写一行"第 N/4 次取号失败…秒后重试"，第 4 次直接判终止
+    assert sum("次取号失败" in m for m in messages) == 3
+    assert any("连续 4 次瞬时故障，终止本批" in m for m in messages)
 
 
 def test_next_gmail_alias_does_not_retry_client_errors(monkeypatch):
@@ -422,7 +423,7 @@ def test_next_gmail_alias_does_not_retry_client_errors(monkeypatch):
         asyncio.run(batch_service._next_gmail_alias(db, log=messages.append))
 
     assert calls == ["alias"]
-    assert any("取号失败且不可重试" in m for m in messages)
+    assert any("取号失败且不可恢复" in m for m in messages)
 
 
 def test_alias_retry_classifier_separates_transient_from_terminal():
@@ -436,6 +437,106 @@ def test_alias_retry_classifier_separates_transient_from_terminal():
     # 4xx 与耗尽类
     assert batch_service._is_retryable_alias_error(HTTPException(404, "没有活跃的 Gmail 会话，请先租号")) is False
     assert batch_service._is_retryable_alias_error(HTTPException(400, "Maximum number of codes reached")) is False
+
+
+def test_alias_classifier_separates_stock_out_from_fatal():
+    """无货是"等一等就有"，余额/Key 是"等也没用"，必须分成两类。"""
+    from fastapi import HTTPException
+
+    assert batch_service._classify_alias_error(HTTPException(502, "getActivation 失败: NO_ACTIVATIONS")) == "stock_out"
+    assert batch_service._classify_alias_error(HTTPException(502, "getNumber: NO_NUMBERS")) == "stock_out"
+    assert batch_service._classify_alias_error(HTTPException(502, "无可用号码")) == "stock_out"
+    assert batch_service._classify_alias_error(HTTPException(502, "ERROR_INSUFFICIENT_BALANCE")) == "fatal"
+    assert batch_service._classify_alias_error(HTTPException(502, "Key 池中没有可用 Key（order=0）")) == "fatal"
+    assert batch_service._classify_alias_error(HTTPException(502, "getActivation 失败: curl 重试后仍失败")) == "retry"
+    assert batch_service._classify_alias_error(RuntimeError("connection reset")) == "retry"
+    assert batch_service._classify_alias_error(HTTPException(400, "Maximum number of codes reached")) == "fatal"
+
+
+@pytest.mark.parametrize(
+    ("attempt", "expected"),
+    [(1, 5.0), (2, 15.0), (3, 30.0), (4, 60.0), (5, 120.0), (6, 300.0), (7, 300.0), (99, 300.0)],
+)
+def test_stock_backoff_ladder_grows_then_caps(attempt, expected):
+    assert batch_service._stock_backoff_seconds(attempt) == expected
+
+
+def test_next_gmail_alias_waits_for_stock_instead_of_killing_batch(monkeypatch):
+    """上游断货不再杀批次：退避等待，补货后自己继续，不需要人工重开。"""
+    import asyncio
+
+    from fastapi import HTTPException
+
+    db = _db_session()
+    calls = []
+
+    async def empty_then_ok(**kwargs):
+        calls.append("alias")
+        if len(calls) <= 3:
+            raise HTTPException(502, "SMSBower Mail 租号失败: NO_ACTIVATIONS")
+        return _gmail_alias_payload()
+
+    _install_gmail_stubs(monkeypatch, empty_then_ok)
+    monkeypatch.setattr(batch_service, "GMAIL_STOCK_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
+    monkeypatch.setattr(batch_service.settings, "gmail_stock_wait_max_minutes", 60)
+    messages = []
+
+    alias, _mail_id, _meta = asyncio.run(batch_service._next_gmail_alias(db, log=messages.append))
+
+    assert len(calls) == 4
+    assert alias == "sample+reg_1@gmail.com"
+    assert sum(1 for m in messages if "等待补货中" in m) == 3
+    assert any("恢复取号成功" in m and "等待补货 3 次" in m for m in messages)
+
+
+def test_next_gmail_alias_gives_up_after_stock_wait_budget(monkeypatch):
+    """只有超过等待预算才终止，并把"等过多久"写进异常，便于区分断货与真故障。"""
+    import asyncio
+
+    from fastapi import HTTPException
+
+    db = _db_session()
+
+    async def always_empty(**kwargs):
+        raise HTTPException(502, "SMSBower Mail 租号失败: NO_ACTIVATIONS")
+
+    _install_gmail_stubs(monkeypatch, always_empty)
+    # 前两次几乎不等待，第三次要等 1 小时 → 超出 1 分钟预算即终止
+    monkeypatch.setattr(batch_service, "GMAIL_STOCK_BACKOFF_SECONDS", (0.0, 0.0, 3600.0))
+    monkeypatch.setattr(batch_service.settings, "gmail_stock_wait_max_minutes", 1)
+    messages = []
+
+    with pytest.raises(TimeoutError) as exc:
+        asyncio.run(batch_service._next_gmail_alias(db, log=messages.append))
+
+    assert "等待 Gmail 订单补货超时" in str(exc.value)
+    assert any("等待补货超时" in m for m in messages)
+
+
+def test_next_gmail_alias_waits_forever_when_cap_is_zero(monkeypatch):
+    """GMAIL_STOCK_WAIT_MAX_MINUTES=0 表示无限等，不受预算约束。"""
+    import asyncio
+
+    from fastapi import HTTPException
+
+    db = _db_session()
+    calls = []
+
+    async def empty_then_ok(**kwargs):
+        calls.append("alias")
+        if len(calls) <= 5:
+            raise HTTPException(502, "SMSBower Mail 租号失败: NO_ACTIVATIONS")
+        return _gmail_alias_payload()
+
+    _install_gmail_stubs(monkeypatch, empty_then_ok)
+    monkeypatch.setattr(batch_service, "GMAIL_STOCK_BACKOFF_SECONDS", (0.0,) * 8)
+    monkeypatch.setattr(batch_service.settings, "gmail_stock_wait_max_minutes", 0)
+    messages = []
+
+    alias, _mail_id, _meta = asyncio.run(batch_service._next_gmail_alias(db, log=messages.append))
+
+    assert alias == "sample+reg_1@gmail.com"
+    assert any("上限 无限" in m for m in messages)
 
 
 def test_get_batch_logs_returns_incremental_persisted_lines():
