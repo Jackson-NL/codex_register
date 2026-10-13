@@ -1,14 +1,9 @@
-"""空闲期定时轮换出口节点（常驻后台任务）。
+"""Codex OAuth 在途期轮换出口节点（常驻后台任务）。
 
-Codex OAuth 的轮换只发生在 job 启动那一刻，之后整个 job 期间锁死一个节点；job 不跑
-的时候出口 IP 更是无限期不变。本调度器在空闲期按随机间隔换节点，使出口 IP 不会长期
-钉死在同一个地址上。
-
-出口 IP 分散策略由 idle_proxy_rotation_during_oauth 决定：默认 True，即 OAuth job 在途时
-照样按随机间隔换节点，让整批账号不会共用一个出口。代价是并发 >1 时，多个账号共用同一个
-本地代理端口，切换瞬间在途账号会一起跳到新出口 IP。设为 False 则回到保守语义——同一次授权
-绝不跨出口 IP（现有 job 路径自身就是把节点锁在整个 job 周期内，见 api/accounts.py 中
-_run_codex_oauth_job 的注释），代价是只在空闲期换。
+轮换只服务 Codex OAuth：只有当存在运行中的 Codex OAuth job（accounts._OAUTH_JOBS
+status=running）时才按随机间隔换节点，让整批授权账号不会共用一个出口 IP；没有
+Codex OAuth 任务时本轮一律不切节点（每 60s 复查一次，OAuth 一启动即恢复轮换）。
+共享同一 clash 实例且有注册批次在途时仍避让，防止切换瞬间把注册账号打到新出口。
 """
 
 from __future__ import annotations
@@ -124,10 +119,8 @@ def oauth_in_flight() -> bool:
 
 
 def busy_reason(shared_with_registration: bool) -> str:
-    # 默认允许在 OAuth job 期间换节点：出口 IP 需要持续分散，而不是整批账号共用一个 IP。
-    # 关掉该开关即恢复"同一次授权绝不跨出口 IP"的保守语义。
-    if not settings.idle_proxy_rotation_during_oauth and oauth_in_flight():
-        return "Codex OAuth job 在途"
+    # 轮换只发生在 Codex OAuth 在途时（门控见 _tick），因此不再存在"OAuth 期间是否换"的
+    # 权衡；这里只保留共享实例时对注册批次的避让，避免切换瞬间把注册账号打到新出口。
     if shared_with_registration and registration_in_flight():
         return "注册任务在途且与注册共用同一实例"
     return ""
@@ -177,6 +170,11 @@ class ProxyRotationScheduler:
         """执行一轮；返回覆盖下次等待秒数的值，None 表示按随机窗口。"""
         if not settings.idle_proxy_rotation_enabled or not settings.clash_rotate_enabled:
             return None
+        # 用户要求：节点轮换只服务 Codex OAuth 在途；没有 Codex OAuth 任务时一律不切节点。
+        # 无任务时按短间隔复查（而不是整个随机窗口沉睡），一旦 OAuth job 启动能尽快进入轮换。
+        if not oauth_in_flight():
+            _log("⏸ 无 Codex OAuth 任务在途，本轮不轮换节点")
+            return float(BUSY_RETRY_SECONDS)
         target = resolve_rotation_target()
         if not target:
             _log("⚠ 注册与 OAuth 两个实例都不可用（控制器不通或订阅已过期），跳过本轮")

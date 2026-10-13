@@ -139,11 +139,16 @@ def build_launch_options(
         # 浏览器运行时（Camoufox 算出 Asia/Tokyo，Intl 仍返回本机 Asia/Shanghai），
         # 所以时区必须由这里显式注入，否则日本出口 + 本机时区是稳定的风控反信号。
         if env.get("timezone_id"):
-            options["timezone_id"] = env["timezone_id"]
+            # timezone_id 是 Playwright context 级参数：persistent 时进
+            # launch_persistent_context（0.5.x 的 launch() 不再容错非 context
+            # 关键字，0.4.11 时代会静默转发给 new_context）；非 persistent 由
+            # 调用方在 browser.new_context(timezone_id=...) 单独注入。
+            if options.get("persistent_context"):
+                options["timezone_id"] = env["timezone_id"]
         viewport = env.get("viewport") or {}
         width, height = int(viewport.get("width", 0)), int(viewport.get("height", 0))
         if width > 0 and height > 0:
-            from browserforge.fingerprints import Screen
+            from camoufox.fingerprints import Screen
 
             # screen 是 Camoufox 原生参数（引擎内消费）：只约束下限保证
             # screen >= viewport（真实窗口化浏览器的合法形态）。

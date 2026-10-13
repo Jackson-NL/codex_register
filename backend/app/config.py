@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     # 轮换时在「良心云」Selector 下只切换名称含这些关键词的节点（逗号分隔，留空=不限制）。
     # 当前节点命名为 emoji+中文，如 🇯🇵日本高速01 / 🇸🇬新加坡高速01，故用 日本,新加坡。
     clash_allowed_region_keywords: str = ""
+    # 节点名关键词白名单（逗号分隔，留空=不限制）：把轮换候选池锁到名称含这些词的节点，
+    # 例如 高速 表示只在 🇺🇸美国高速01~05 之间轮换，不再随机到慢速/不可用节点。
+    clash_allowed_node_keywords: str = ""
     # 节点延迟上限(ms)：主动测速或历史延迟超过该值视为不可用，跳过并切换下一个节点。0=不限制。
     clash_max_delay_ms: int = 3000
     # Codex OAuth 独立 Mihomo 实例（与注册工作台隔离，避免轮换互相打断）：

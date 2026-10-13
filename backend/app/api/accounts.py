@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+import random
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 from typing import Annotated, Literal
@@ -966,6 +967,30 @@ async def _select_oauth_proxy(job: dict) -> str:
     return requested
 
 
+# 瞬态失败(可自动重试)与凭证/账号类失败(不重试,守风控纪律)的错误关键词分类。
+# 只对网络抖动/OAuth callback 未捕获等瞬态问题做有限重试；token revoked/deactivated/
+# 手机二次验证等账号真实状态问题一律不重试。
+_RETRYABLE_OAUTH_MARKERS = (
+    "oauth callback", "callback",
+    "ns_error_net_reset", "网络中断", "连接被重置", "页面卡住", "网络层中断",
+    "timeout", "timed out", "超时", "timeouterror", "err_connection",
+    "connection reset", "connectionreset", "network error", "网络错误",
+    "unexpected error", "processing your request",
+)
+_NON_RETRYABLE_OAUTH_MARKERS = (
+    "token revoked", "invalidated oauth token", "deactivated", "账号已停用",
+    "phone_second_verification", "二次验证", "手机验证", "two-factor", "2fa",
+    "too many requests", "rate limit", "429",
+)
+
+
+def _is_retryable_oauth_error(message: str) -> bool:
+    lowered = str(message or "").lower()
+    if any(marker in lowered for marker in _NON_RETRYABLE_OAUTH_MARKERS):
+        return False
+    return any(marker in lowered for marker in _RETRYABLE_OAUTH_MARKERS)
+
+
 async def _run_codex_oauth_job(job_id: str, payload: CodexOAuthJobBody) -> None:
     global _ACTIVE_OAUTH_JOB_ID
     job = _OAUTH_JOBS[job_id]
@@ -988,27 +1013,44 @@ async def _run_codex_oauth_job(job_id: str, payload: CodexOAuthJobBody) -> None:
             _ensure_oauth_not_cancelled(job)
             db = SessionLocal()
             try:
-                result = await _run_codex_oauth_target(job, int(account_id), payload, db)
-                job["results"].append({
-                    **result,
-                    "status": "success",
-                    "error": "",
-                    "completed_at": datetime.now(timezone.utc).isoformat(),
-                })
-                emit_log(f"[acc_{account_id}] OAuth 结果已返回：access_token={'yes' if result.get('has_access_token') else 'no'} refresh_token={'yes' if result.get('has_refresh_token') else 'no'}", flush=True)
-                return True
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001
-                has_failure = True
-                message = str(error)
-                job["results"].append({
-                    "id": int(account_id),
-                    "status": "failed",
-                    "error": message,
-                    "error_type": str(getattr(error, "error_type", "") or ""),
-                })
-                emit_log(f"[acc_{account_id}] 失败：{message[:1200]}", flush=True)
+                # 瞬态失败自动重试：最多重试 2 次，间隔 6~12s（随机抖动）。
+                # 凭证/账号类失败(见 _is_retryable_oauth_error)不重试,直接判定失败。
+                max_retries = 2
+                for attempt in range(max_retries + 1):
+                    try:
+                        result = await _run_codex_oauth_target(job, int(account_id), payload, db)
+                        job["results"].append({
+                            **result,
+                            "status": "success",
+                            "error": "",
+                            "completed_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        emit_log(f"[acc_{account_id}] OAuth 结果已返回：access_token={'yes' if result.get('has_access_token') else 'no'} refresh_token={'yes' if result.get('has_refresh_token') else 'no'}", flush=True)
+                        return True
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:  # noqa: BLE001
+                        message = str(error)
+                        if attempt >= max_retries or not _is_retryable_oauth_error(message):
+                            has_failure = True
+                            job["results"].append({
+                                "id": int(account_id),
+                                "status": "failed",
+                                "error": message,
+                                "error_type": str(getattr(error, "error_type", "") or ""),
+                            })
+                            emit_log(f"[acc_{account_id}] 失败：{message[:1200]}", flush=True)
+                            return False
+                        wait = random.uniform(6.0, 12.0)
+                        emit_log(
+                            f"[acc_{account_id}] 瞬态失败({message[:140]}），{wait:.0f}s 后重试 {attempt + 1}/{max_retries}",
+                            flush=True,
+                        )
+                        try:
+                            db.rollback()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        await asyncio.sleep(wait)
                 return False
             finally:
                 _oauth_finish_target(job, int(account_id))

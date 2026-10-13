@@ -105,6 +105,25 @@ def _parse_region_keywords(raw: str | list[str] | None) -> list[str]:
     return [k.strip().lower() for k in str(raw or "").split(",") if k.strip()]
 
 
+def _parse_node_keywords(raw: str | list[str] | None) -> list[str]:
+    if raw is None:
+        raw = str(getattr(settings, "clash_allowed_node_keywords", "") or "").strip()
+    if isinstance(raw, list):
+        return [str(k).strip().lower() for k in raw if str(k).strip()]
+    return [k.strip().lower() for k in str(raw or "").split(",") if k.strip()]
+
+
+def _node_keywords() -> list[str]:
+    return _parse_node_keywords(None)
+
+
+def _node_name_allowed(name: str, keywords: list[str]) -> bool:
+    if not keywords:
+        return True
+    lowered = str(name).lower()
+    return any(k in lowered for k in keywords)
+
+
 def _region_keywords() -> list[str]:
     return _parse_region_keywords(None)
 
@@ -137,6 +156,7 @@ def _real_candidates(
 ) -> list[str]:
     if region_keywords is None:
         region_keywords = _region_keywords()
+    node_keywords = _node_keywords()
     selector = proxies.get(selector_name) or {}
     all_names = list(selector.get("all") or [])
     return [
@@ -147,6 +167,7 @@ def _real_candidates(
         and str(proxies[name].get("type") or "") in REAL_NODE_TYPES
         and (not skip_unhealthy or not _node_marked_unhealthy(proxies[name]))
         and _region_allowed(name, region_keywords)
+        and _node_name_allowed(name, node_keywords)
     ]
 
 

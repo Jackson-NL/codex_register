@@ -19,6 +19,16 @@ _*.py
 _*.txt
 mail_dump.json
 
+# Build artifacts / binaries
+*.exe
+gateway/gateway.exe*
+
+# Temp diagnostic scripts
+backend/scripts/tmp_*.py
+
+# Internal media (not for public)
+_media/
+
 # Capture / mitmproxy
 capture/
 

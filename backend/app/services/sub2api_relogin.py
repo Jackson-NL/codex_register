@@ -666,7 +666,10 @@ class Sub2APIReloginService:
     async def _preview_with_db(self, group_ids: list[int], only_error: bool, db: Session) -> dict[str, Any]:
         client = self._new_client()
         try:
-            remote_accounts = await client.list_accounts(group_ids)
+            # rc.40 不接受 group= 逗号参数(200+空列表,非 4xx),导致带 group
+            # 的候选全落空;include_all_groups=True 把全量候选提前,拉到全量后
+            # 在本函数按 group_ids 本地过滤,避免"候选 URL 全落空误报 0 账号"。
+            remote_accounts = await client.list_accounts(group_ids, include_all_groups=True)
             local_accounts = list(db.scalars(select(Account)).all())
             exact, gmail = _build_local_indexes(local_accounts)
             items = []
