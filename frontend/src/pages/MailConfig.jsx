@@ -36,38 +36,32 @@ const DEFAULT_FORM = {
     rate_limit_backoff: 10,
     has_site_password: false,
   },
-  outlook: {
+  icloud: {
     enabled: false,
     mode: "manual_pool",
     accounts_pool: "",
     accounts_count: 0,
     accounts_sample: [],
-    poll_interval: 5,
+    poll_interval: 4,
     poll_timeout: 180,
-    sender_filter: "",
-    subject_filter: "",
-    imap_host: "outlook.office365.com",
-    imap_port: 993,
-    imap_ssl: true,
-    graph_tenant_id: "",
-    graph_client_id: "",
-    graph_client_secret: "",
-    has_graph_client_secret: false,
+    split_enabled: false,
+    split_prefix: "",
+    split_tag_length: 6,
+    split_max_per_base: 0,
   },
 };
 
 function normalizeConfig(data) {
   const cf = { ...DEFAULT_FORM.cf_temp_email, ...(data?.cf_temp_email || {}) };
-  const outlook = { ...DEFAULT_FORM.outlook, ...(data?.outlook || {}) };
+  const icloud = { ...DEFAULT_FORM.icloud, ...(data?.icloud || {}) };
   cf.site_password = cf.has_site_password ? MASK : "";
   cf.custom_pool = "";
   cf.inbox_jwt = cf.has_inbox_jwt ? MASK : "";
-  outlook.accounts_pool = "";
-  outlook.graph_client_secret = outlook.has_graph_client_secret ? MASK : "";
+  icloud.accounts_pool = "";
   return {
     provider: data?.provider || DEFAULT_FORM.provider,
     cf_temp_email: cf,
-    outlook,
+    icloud,
   };
 }
 
@@ -109,10 +103,9 @@ function fieldErrors(form) {
   for (const key of ["random_length", "poll_interval", "poll_timeout", "max_retries", "rate_limit_backoff"]) {
     if (!Number.isInteger(Number(cf[key])) || Number(cf[key]) <= 0) errors[`cf_${key}`] = "必须为正整数";
   }
-  const out = form.outlook;
-  if (!Number.isInteger(Number(out.poll_interval)) || Number(out.poll_interval) <= 0) errors.out_poll_interval = "必须为正整数";
-  if (!Number.isInteger(Number(out.poll_timeout)) || Number(out.poll_timeout) <= 0) errors.out_poll_timeout = "必须为正整数";
-  if (!Number.isInteger(Number(out.imap_port)) || Number(out.imap_port) <= 0) errors.imap_port = "必须为正整数";
+  const ic = form.icloud;
+  if (!Number.isInteger(Number(ic.poll_interval)) || Number(ic.poll_interval) <= 0) errors.ic_poll_interval = "必须为正整数";
+  if (!Number.isInteger(Number(ic.poll_timeout)) || Number(ic.poll_timeout) <= 0) errors.ic_poll_timeout = "必须为正整数";
   return errors;
 }
 
@@ -178,6 +171,18 @@ function ProviderCard({ active, icon, title, description, status, onClick }) {
   );
 }
 
+function CollapseSection({ title, defaultOpen = true, badge, children }) {
+  return (
+    <details open={defaultOpen} className="group rounded-md border border-slate-200 bg-white">
+      <summary className="flex cursor-pointer select-none items-center justify-between px-3 py-2 text-xs font-semibold text-slate-600 hover:text-blue-600">
+        <span className="flex items-center gap-1.5">{title}{badge}</span>
+        <span className="text-slate-300 transition-transform group-open:rotate-180">▾</span>
+      </summary>
+      <div className="space-y-4 border-t border-slate-100 p-3">{children}</div>
+    </details>
+  );
+}
+
 export default function MailConfig() {
   const { toast, t } = useApp();
   const [form, setForm] = useState(clone(DEFAULT_FORM));
@@ -193,8 +198,8 @@ export default function MailConfig() {
   const [poolImportError, setPoolImportError] = useState("");
   const [selectedIds, setSelectedIds] = useState([]);
   const [poolBusy, setPoolBusy] = useState(false);
-  const [touched, setTouched] = useState({ sitePassword: false, inboxJwt: false, accountsPool: false, graphSecret: false });
-  const [visible, setVisible] = useState({ sitePassword: false, inboxJwt: false, graphSecret: false });
+  const [touched, setTouched] = useState({ sitePassword: false, inboxJwt: false, accountsPool: false });
+  const [visible, setVisible] = useState({ sitePassword: false, inboxJwt: false });
 
   const load = async () => {
     setLoading(true);
@@ -208,7 +213,7 @@ export default function MailConfig() {
       setPoolImport("");
       setPoolImportError("");
       setSelectedIds([]);
-      setTouched({ sitePassword: false, inboxJwt: false, accountsPool: false, graphSecret: false });
+      setTouched({ sitePassword: false, inboxJwt: false, accountsPool: false });
     } catch (error) {
       toast(`邮箱配置加载失败: ${error.message}`, "error");
     } finally {
@@ -222,8 +227,7 @@ export default function MailConfig() {
     setForm((current) => ({ ...current, [section]: { ...current[section], [key]: value } }));
     if (section === "cf_temp_email" && key === "site_password") setTouched((state) => ({ ...state, sitePassword: true }));
     if (section === "cf_temp_email" && key === "inbox_jwt") setTouched((state) => ({ ...state, inboxJwt: true }));
-    if (section === "outlook" && key === "accounts_pool") setTouched((state) => ({ ...state, accountsPool: true }));
-    if (section === "outlook" && key === "graph_client_secret") setTouched((state) => ({ ...state, graphSecret: true }));
+    if (section === "icloud" && key === "accounts_pool") setTouched((state) => ({ ...state, accountsPool: true }));
   };
 
   const applyConfigResponse = (data) => {
@@ -234,7 +238,44 @@ export default function MailConfig() {
     setLastTest(data.test_status || null);
   };
 
+  const importIcloudPool = async () => {
+    const lines = String(poolImport || "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    const valid = lines.filter((line) => {
+      const [email, api] = line.split("----").map((s) => s.trim());
+      return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email || "") && /^https?:\/\//.test(api || "");
+    });
+    const invalid = lines.length - valid.length;
+    if (!valid.length) {
+      setPoolImportError(invalid ? `没有可导入的有效账号（${invalid} 行格式错误，每行需 邮箱----收信API）` : "请先粘贴至少一个账号（邮箱----收信API）");
+      return;
+    }
+    const savedCount = form.icloud.accounts_count || 0;
+    const append = poolImportMode === "append" && savedCount > 0;
+    if (!append && savedCount > 0) {
+      if (!window.confirm(`替换全部会清空当前已配置的 ${savedCount} 个账号（导入为增量合并或整体替换），确认替换？`)) return;
+    }
+    setPoolBusy(true);
+    setPoolImportError("");
+    try {
+      const data = await api.mailConfig.save({
+        icloud: { accounts_pool: valid.join("\n"), accounts_pool_append: append || undefined },
+      });
+      applyConfigResponse(data);
+      setPoolImport("");
+      setPoolImportOpen(false);
+      toast(
+        `已导入 ${valid.length} 条账号${invalid ? `，忽略 ${invalid} 条格式错误` : ""}`,
+        invalid ? "warning" : "success"
+      );
+    } catch (error) {
+      setPoolImportError(`导入失败: ${error.message}`);
+    } finally {
+      setPoolBusy(false);
+    }
+  };
+
   const importPool = async () => {
+    if (form.provider === "icloud") return importIcloudPool();
     const { valid, invalid } = parsePoolText(poolImport);
     if (!valid.length) {
       setPoolImportError(invalid.length ? `没有可导入的有效邮箱（${invalid.length} 条格式错误）` : "请先粘贴至少一个邮箱地址");
@@ -272,7 +313,6 @@ export default function MailConfig() {
   const errors = useMemo(() => fieldErrors(form), [form]);
   const dirty = useMemo(() => JSON.stringify(form) !== JSON.stringify(serverForm), [form, serverForm]);
   const cfConfigured = form.cf_temp_email.has_site_password;
-  const graphConfigured = form.outlook.has_graph_client_secret;
   const poolStatus = form.cf_temp_email.custom_pool_status_counts || {};
   const poolSummary = form.cf_temp_email.custom_pool_summary || {};
   const savedPoolItems = form.cf_temp_email.custom_pool_items || [];
@@ -366,15 +406,11 @@ export default function MailConfig() {
   };
 
   const buildPayload = () => {
-    const outlook = { ...form.outlook };
-    delete outlook.accounts_count;
-    delete outlook.accounts_sample;
-    delete outlook.has_graph_client_secret;
-    if (!touched.accountsPool) delete outlook.accounts_pool;
-    if (!touched.graphSecret || !outlook.graph_client_secret || outlook.graph_client_secret === MASK) {
-      delete outlook.graph_client_secret;
-    }
-    return { provider: form.provider, cf_temp_email: buildCfPayload(), outlook };
+    const icloud = { ...form.icloud };
+    delete icloud.accounts_count;
+    delete icloud.accounts_sample;
+    if (!touched.accountsPool) delete icloud.accounts_pool;
+    return { provider: form.provider, cf_temp_email: buildCfPayload(), icloud };
   };
 
   const validate = () => {
@@ -395,7 +431,7 @@ export default function MailConfig() {
       setServerForm(clone(normalized));
       setUpdatedAt(data.updated_at || null);
       setLastTest(data.test_status || lastTest);
-      setTouched({ sitePassword: false, inboxJwt: false, accountsPool: false, graphSecret: false });
+      setTouched({ sitePassword: false, inboxJwt: false, accountsPool: false });
       setSelectedIds([]);
       toast("邮箱配置已保存", "success");
     } catch (error) {
@@ -425,7 +461,7 @@ export default function MailConfig() {
     if (!serverForm) return;
     setForm(clone(serverForm));
     setSelectedIds([]);
-    setTouched({ sitePassword: false, inboxJwt: false, accountsPool: false, graphSecret: false });
+    setTouched({ sitePassword: false, inboxJwt: false, accountsPool: false });
     toast("已撤销未保存修改", "info");
   };
 
@@ -438,7 +474,7 @@ export default function MailConfig() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h2 className="text-[16px] font-semibold text-slate-800">邮箱配置</h2>
-          <div className="mt-0.5 text-xs text-slate-400">注册流程邮箱 Provider · Cloudflare 临时邮箱与 Outlook 账号池</div>
+          <div className="mt-0.5 text-xs text-slate-400">注册流程邮箱 Provider · Cloudflare 临时邮箱与 iCloud 邮箱池</div>
         </div>
         <div className="flex items-center gap-2">
           {dirty && <Badge color="warning">有未保存修改</Badge>}
@@ -447,11 +483,36 @@ export default function MailConfig() {
         </div>
       </div>
 
+      {(() => {
+        const isCloud = form.provider === "icloud";
+        const cfg = isCloud ? form.icloud : form.cf_temp_email;
+        const poolEmpty = isCloud
+          ? !(form.icloud.accounts_count > 0)
+          : form.cf_temp_email.address_mode === "custom_pool" && !(form.cf_temp_email.custom_pool_count > 0);
+        const fallbackOk = isCloud ? form.cf_temp_email.enabled : form.icloud.enabled;
+        let ok = true;
+        let msg = "";
+        if (!cfg.enabled) {
+          ok = false;
+          msg = `当前邮箱来源「${isCloud ? "iCloud 邮箱池" : "CF 临时邮箱"}」未启用，注册将${fallbackOk ? `回退到「${isCloud ? "CF 临时邮箱" : "iCloud 邮箱池"}」。可在下方启用。` : "无法取号（两个 Provider 均未启用）。"}`;
+        } else if (poolEmpty) {
+          ok = false;
+          msg = `「${isCloud ? "iCloud" : "CF 自定义池"}」已启用但邮箱池为空，注册会因无可用邮箱失败，请先批量导入。`;
+        } else {
+          msg = `当前邮箱来源「${isCloud ? "iCloud 邮箱池" : "CF 临时邮箱"}」已启用，可用于注册。`;
+        }
+        return (
+          <div className={`mb-3 flex items-start gap-2 rounded-md border px-3 py-2.5 text-xs ${ok ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-amber-200 bg-amber-50 text-amber-700"}`}>
+            {ok ? <CheckCircle2 size={14} className="mt-0.5 shrink-0" /> : <XCircle size={14} className="mt-0.5 shrink-0" />}
+            <span>{msg}</span>
+          </div>
+        );
+      })()}
       <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
         <Panel title="当前 Provider">
           <div className="flex items-center gap-2 text-sm font-semibold text-slate-700">
             <Mail size={16} className="text-blue-600" />
-            {form.provider === "cf_temp_email" ? "Cloudflare 临时邮箱" : "Outlook 账号池"}
+            {form.provider === "cf_temp_email" ? "Cloudflare 临时邮箱" : "iCloud 邮箱池"}
           </div>
           <div className="mt-1 text-xs text-slate-400">{form.provider}</div>
         </Panel>
@@ -479,12 +540,12 @@ export default function MailConfig() {
             onClick={() => setForm((current) => ({ ...current, provider: "cf_temp_email" }))}
           />
           <ProviderCard
-            active={form.provider === "outlook"}
+            active={form.provider === "icloud"}
             icon={<Inbox size={18} />}
-            title="Outlook 账号池"
-            description="导入固定账号池；manual_pool 自动收信仍需 IMAP/Graph。"
-            status={t(`${form.outlook.accounts_count} 个账号 · ${form.outlook.enabled ? "已启用" : "已停用"}`)}
-            onClick={() => setForm((current) => ({ ...current, provider: "outlook" }))}
+            title="iCloud 邮箱池"
+            description="导入预置 @icloud.com 账号；验证码由每行自带的 wdmail 收信 API 自动获取。"
+            status={t(`${form.icloud.accounts_count} 个账号 · ${form.icloud.enabled ? "已启用" : "已停用"}`)}
+            onClick={() => setForm((current) => ({ ...current, provider: "icloud" }))}
           />
         </div>
       </Panel>
@@ -494,7 +555,7 @@ export default function MailConfig() {
           title={<span className="flex items-center gap-2"><Cloud size={15} className="text-blue-600" />cf_temp_email</span>}
           extra={form.provider === "cf_temp_email" && <Badge color="info" dot>当前启用</Badge>}
         >
-          <div className="space-y-4">
+          <CollapseSection title="基础参数" badge={form.cf_temp_email.enabled ? <Badge color="success" dot>已启用</Badge> : <Badge color="neutral">未启用</Badge>}>
             <div className="flex items-center justify-between rounded-md bg-slate-50 px-3 py-2">
               <div><div className="text-[13px] font-medium text-slate-700">启用 Provider</div><div className="text-[11px] text-slate-400">注册流程会使用该服务</div></div>
               <Switch checked={form.cf_temp_email.enabled} onChange={(value) => patch("cf_temp_email", "enabled", value)} />
@@ -515,6 +576,8 @@ export default function MailConfig() {
               <FormNumber label="最大重试次数" value={form.cf_temp_email.max_retries} error={errors.cf_max_retries} onChange={(value) => patch("cf_temp_email", "max_retries", value)} />
               <FormNumber label="429 退避（秒）" value={form.cf_temp_email.rate_limit_backoff} error={errors.cf_rate_limit_backoff} onChange={(value) => patch("cf_temp_email", "rate_limit_backoff", value)} />
             </div>
+          </CollapseSection>
+            <CollapseSection title="自定义邮箱池" badge={<Badge color={form.cf_temp_email.custom_pool_count ? "success" : "warning"}>{form.cf_temp_email.custom_pool_count} 个</Badge>}>
             {form.cf_temp_email.address_mode === "custom_pool" && (
               <div className="space-y-4 rounded-md border border-blue-100 bg-blue-50/40 p-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
@@ -606,6 +669,8 @@ export default function MailConfig() {
                 </div>
               </div>
             )}
+          </CollapseSection>
+            <CollapseSection title="站点访问凭证">
             <SecretInput
               label="站点访问密码"
               value={form.cf_temp_email.site_password}
@@ -615,68 +680,74 @@ export default function MailConfig() {
               onChange={(value) => patch("cf_temp_email", "site_password", value)}
               hint="请求会通过 x-custom-auth 发送，接口不会返回明文。"
             />
-          </div>
+          </CollapseSection>
         </Panel>
 
         <Panel
-          title={<span className="flex items-center gap-2"><AtSign size={15} className="text-violet-600" />outlook</span>}
-          extra={form.provider === "outlook" && <Badge color="primary" dot>当前启用</Badge>}
+          title={<span className="flex items-center gap-2"><AtSign size={15} className="text-violet-600" />icloud</span>}
+          extra={form.provider === "icloud" && <Badge color="primary" dot>当前启用</Badge>}
         >
-          <div className="space-y-4">
+          <CollapseSection title="基础参数" badge={form.icloud.enabled ? <Badge color="success" dot>已启用</Badge> : <Badge color="neutral">未启用</Badge>}>
             <div className="flex items-center justify-between rounded-md bg-slate-50 px-3 py-2">
-              <div><div className="text-[13px] font-medium text-slate-700">启用 Provider</div><div className="text-[11px] text-slate-400">第一阶段使用 manual_pool</div></div>
-              <Switch checked={form.outlook.enabled} onChange={(value) => patch("outlook", "enabled", value)} />
+              <div><div className="text-[13px] font-medium text-slate-700">启用 Provider</div><div className="text-[11px] text-slate-400">注册时从池中取用 @icloud.com 地址并自动收验证码</div></div>
+              <Switch checked={form.icloud.enabled} onChange={(value) => patch("icloud", "enabled", value)} />
             </div>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <Select label="收信模式" options={[{ value: "manual_pool", label: "manual_pool" }, { value: "imap", label: "imap（预留）" }, { value: "graph", label: "graph（预留）" }]} value={form.outlook.mode} onChange={(value) => patch("outlook", "mode", value)} />
-              <div className="flex items-end pb-1 text-xs text-slate-500"><Users size={14} className="mr-1.5 text-slate-400" />{t(`已配置 ${form.outlook.accounts_count} 个账号`)}</div>
+              <Select label="收信模式" options={[{ value: "manual_pool", label: "manual_pool（wdmail 网页取件）" }]} value={form.icloud.mode} onChange={(value) => patch("icloud", "mode", value)} />
+              <div className="flex items-end pb-1 text-xs text-slate-500"><Users size={14} className="mr-1.5 text-slate-400" />{t(`已配置 ${form.icloud.accounts_count} 个账号`)}</div>
             </div>
+            <div className="rounded-md border border-slate-200 bg-white px-3 py-2">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-[13px] font-medium text-slate-700">分裂模式（+ 别名派生）</div>
+                  <div className="text-[11px] text-slate-400">一个基础邮箱+key 派生 root+tag@域 注册多号；需收信服务支持 + 别名归一（tongsheep 已实测支持）</div>
+                </div>
+                <Switch checked={form.icloud.split_enabled} onChange={(value) => patch("icloud", "split_enabled", value)} />
+              </div>
+              {form.icloud.split_enabled && (
+                <div className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                  <Input label="tag 前缀" value={form.icloud.split_prefix} placeholder="可选，如 auto_" onChange={(e) => patch("icloud", "split_prefix", e.target.value)} />
+                  <FormNumber label="tag 长度" value={form.icloud.split_tag_length} onChange={(value) => patch("icloud", "split_tag_length", value)} />
+                  <FormNumber label="每基础上限(0=不限)" value={form.icloud.split_max_per_base} onChange={(value) => patch("icloud", "split_max_per_base", value)} />
+                </div>
+              )}
+            </div>
+            </CollapseSection>
+            <CollapseSection title="iCloud 邮箱池" badge={<Badge color={form.icloud.accounts_count ? "success" : "warning"}>{form.icloud.accounts_count} 个</Badge>}>
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-slate-200 bg-white px-3 py-2">
+                <span className="text-xs text-slate-600">{form.icloud.accounts_sample?.length ? `已配置 ${form.icloud.accounts_count} 个账号（收信 API 不回显）` : "尚未导入账号，注册会因无邮箱失败"}</span>
+                <Button variant="secondary" size="sm" icon={<Upload size={13} />} onClick={() => { setPoolImportOpen(true); setPoolImportError(""); }}>批量导入</Button>
+              </div>
             <label className="block">
-              <span className="mb-1 block text-xs font-medium text-slate-600">账号池</span>
+              <span className="mb-1 block text-xs font-medium text-slate-600">iCloud 邮箱池</span>
               <textarea
                 className="input min-h-28 resize-y font-mono text-xs"
-                value={form.outlook.accounts_pool}
-                placeholder={form.outlook.accounts_count ? `已配置 ${form.outlook.accounts_count} 个账号；输入新内容可替换，留空不修改` : "每行一个：email,password 或 email----password"}
-                onChange={(e) => patch("outlook", "accounts_pool", e.target.value)}
+                value={form.icloud.accounts_pool}
+                placeholder={form.icloud.accounts_count ? `已配置 ${form.icloud.accounts_count} 个账号；输入新内容可替换，留空不修改` : "每行一个：邮箱----收信API\n例：98.musks.horn@icloud.com----https://api.wdmail.top/m?"}
+                onChange={(e) => patch("icloud", "accounts_pool", e.target.value)}
               />
-              <span className="mt-1 block text-[11px] text-slate-400">保存和接口返回均不会回显密码。清空文本并保存可清除账号池。</span>
+              <span className="mt-1 block text-[11px] text-slate-400">保存和接口返回均不会回显收信 API。清空文本并保存可清除邮箱池。</span>
             </label>
-            {form.outlook.accounts_sample?.length > 0 && (
-              <div className="flex flex-wrap items-center gap-1.5"><span className="text-[11px] text-slate-400">样例：</span>{form.outlook.accounts_sample.map((sample) => <Badge key={sample} color="neutral">{sample}</Badge>)}</div>
+            {form.icloud.accounts_sample?.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5"><span className="text-[11px] text-slate-400">样例：</span>{form.icloud.accounts_sample.map((sample) => <Badge key={sample} color="neutral">{sample}</Badge>)}</div>
             )}
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <FormNumber label="轮询间隔（秒）" value={form.outlook.poll_interval} error={errors.out_poll_interval} onChange={(value) => patch("outlook", "poll_interval", value)} />
-              <FormNumber label="验证码超时（秒）" value={form.outlook.poll_timeout} error={errors.out_poll_timeout} onChange={(value) => patch("outlook", "poll_timeout", value)} />
-              <Input label="发件人过滤" value={form.outlook.sender_filter} onChange={(e) => patch("outlook", "sender_filter", e.target.value)} />
-              <Input label="主题过滤" value={form.outlook.subject_filter} onChange={(e) => patch("outlook", "subject_filter", e.target.value)} />
+              <FormNumber label="轮询间隔（秒）" value={form.icloud.poll_interval} error={errors.ic_poll_interval} onChange={(value) => patch("icloud", "poll_interval", value)} />
+              <FormNumber label="验证码超时（秒）" value={form.icloud.poll_timeout} error={errors.ic_poll_timeout} onChange={(value) => patch("icloud", "poll_timeout", value)} />
             </div>
-            <div className="border-t border-slate-100 pt-3">
-              <div className="mb-3 flex items-center gap-1.5 text-xs font-medium text-slate-600"><ShieldCheck size={14} />IMAP / Graph 预留字段</div>
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <Input label="IMAP Host" value={form.outlook.imap_host} onChange={(e) => patch("outlook", "imap_host", e.target.value)} />
-                <FormNumber label="IMAP Port" value={form.outlook.imap_port} error={errors.imap_port} onChange={(value) => patch("outlook", "imap_port", value)} />
-                <Input label="Graph Tenant ID" value={form.outlook.graph_tenant_id} onChange={(e) => patch("outlook", "graph_tenant_id", e.target.value)} />
-                <Input label="Graph Client ID" value={form.outlook.graph_client_id} onChange={(e) => patch("outlook", "graph_client_id", e.target.value)} />
-                <div className="flex items-end pb-1"><Switch checked={form.outlook.imap_ssl} label="IMAP SSL" onChange={(value) => patch("outlook", "imap_ssl", value)} /></div>
-                <SecretInput
-                  label="Graph Client Secret"
-                  value={form.outlook.graph_client_secret}
-                  configured={graphConfigured}
-                  visible={visible.graphSecret}
-                  onToggle={() => setVisible((state) => ({ ...state, graphSecret: !state.graphSecret }))}
-                  onChange={(value) => patch("outlook", "graph_client_secret", value)}
-                />
-              </div>
-            </div>
-          </div>
+          </CollapseSection>
         </Panel>
       </div>
 
-      <div className="flex flex-wrap items-center gap-3 border-t border-slate-200 pt-3">
+      <div className="sticky bottom-0 z-10 -mx-4 flex flex-wrap items-center gap-3 border-t border-slate-200 bg-white/95 px-4 py-3 backdrop-blur">
         <Button variant="secondary" icon={testing ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />} onClick={testConnection} disabled={testing}>
           {testing ? "测试中…" : "测试当前 Provider"}
         </Button>
         {lastTest && <span className={`flex items-center gap-1.5 text-xs ${lastTest.ok ? "text-emerald-600" : "text-red-600"}`}><KeyRound size={13} />{lastTest.message}</span>}
+        <div className="ml-auto flex items-center gap-2">
+          {dirty && <Badge color="warning">有未保存修改</Badge>}
+          <Button icon={<Save size={13} />} onClick={save} loading={saving}>保存配置</Button>
+        </div>
       </div>
       {poolImportOpen && (
         <div className="fixed inset-0 z-40 bg-slate-950/30" onMouseDown={(event) => { if (event.target === event.currentTarget) setPoolImportOpen(false); }}>
@@ -689,10 +760,10 @@ export default function MailConfig() {
               <div className="grid grid-cols-2 gap-2 rounded-md bg-slate-100 p-1">
                 {[{ value: "append", label: "追加（保留旧地址）" }, { value: "replace", label: "替换全部地址" }].map((option) => <button key={option.value} type="button" onClick={() => setPoolImportMode(option.value)} className={`rounded px-2 py-1.5 text-xs font-medium ${poolImportMode === option.value ? "bg-white text-blue-700 shadow-sm" : "text-slate-500"}`}>{option.label}</button>)}
               </div>
-              {poolImportMode === "append" && (form.cf_temp_email.custom_pool_count || 0) > 0 && (
-                <div className="rounded-md bg-blue-50 px-3 py-2 text-xs text-blue-700">已保存 {form.cf_temp_email.custom_pool_count} 个地址；导入后直接追加到池尾并立即生效，旧地址保持不变。</div>
+              {poolImportMode === "append" && (form.provider === "icloud" ? (form.icloud.accounts_count || 0) : (form.cf_temp_email.custom_pool_count || 0)) > 0 && (
+                <div className="rounded-md bg-blue-50 px-3 py-2 text-xs text-blue-700">{form.provider === "icloud" ? `已保存 ${form.icloud.accounts_count} 个账号；导入后直接追加到池尾并立即生效，旧账号保持不变。` : `已保存 ${form.cf_temp_email.custom_pool_count} 个地址；导入后直接追加到池尾并立即生效，旧地址保持不变。`}</div>
               )}
-              <textarea autoFocus value={poolImport} onChange={(event) => { setPoolImport(event.target.value); setPoolImportError(""); }} className="input min-h-56 resize-y font-mono text-xs" placeholder="name@example.com\nsecond@example.com" />
+              <textarea autoFocus value={poolImport} onChange={(event) => { setPoolImport(event.target.value); setPoolImportError(""); }} className="input min-h-56 resize-y font-mono text-xs" placeholder={form.provider === "icloud" ? "98.musks.horn@icloud.com----https://api.wdmail.top/m?" : "name@example.com\nsecond@example.com"} />
               {poolImportError && <div className={`rounded-md px-3 py-2 text-xs ${poolImportError.includes("忽略") ? "bg-amber-50 text-amber-700" : "bg-red-50 text-red-700"}`}>{poolImportError}</div>}
               <div className="rounded-md border border-slate-200 bg-slate-50 p-3 text-xs text-slate-500"><div className="mb-2 flex items-center gap-2 font-medium text-slate-700"><ListChecks size={14} />导入规则</div><div>• 导入立即保存生效，无需再点保存</div><div>• 自动去重并统一转为小写</div><div>• 无效格式不会进入地址池</div><div>• 追加不会覆盖已保存地址，重复地址自动忽略</div><div>• 替换全部会从池中移除当前所有地址</div></div>
             </div>

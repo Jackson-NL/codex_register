@@ -345,3 +345,30 @@ class HealthCheck(Base):
     result: Mapped[str] = mapped_column(String(16), default="ok")
     detail: Mapped[str] = mapped_column(Text, default="")
     checked_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class IcloudExhaustedRoot(Base):
+    """iCloud 分裂模式：被 OpenAI 判定「账号可能已存在」而耗尽的主邮箱 root。
+
+    持久化保证进程重启后仍跳过该邮箱的全部别名——内存集合重启即忘，
+    会导致同一个烧毁的基础邮箱被反复取出、反复撞同一堵墙。
+    """
+
+    __tablename__ = "icloud_exhausted_roots"
+
+    root: Mapped[str] = mapped_column(String(255), primary_key=True)
+    marked_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+class IcloudKnownRegistered(Base):
+    """iCloud：已确认「账号已注册」的邮箱地址（密码阶段被甩到登录页）。
+
+    与 accounts 表的区别：accounts 只记*我们注册成功*的账号；本表记
+    *池里取到才发现已有账号*的地址——不记的话每次轮询都会重新取出、
+    重新烧一轮浏览器会话（10 分钟分配窗一过就复发）。
+    """
+
+    __tablename__ = "icloud_known_registered"
+
+    email: Mapped[str] = mapped_column(String(255), primary_key=True)
+    marked_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)

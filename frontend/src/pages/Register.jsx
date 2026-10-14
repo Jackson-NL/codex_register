@@ -37,6 +37,18 @@ const GMAIL_STATUS_META = {
   released: ["neutral", "已释放"],
 };
 
+// 从邮箱配置响应提取 iCloud 剩余轮数预测（非 icloud / 无数据时返回 null）
+function readIcloudRounds(data) {
+  const icloud = data?.icloud;
+  if (!icloud) return null;
+  return {
+    remaining: Number(icloud.remaining_rounds) || 0,
+    pool: Number(icloud.pool_size) || 0,
+    exhausted: Number(icloud.exhausted_roots) || 0,
+    split: !!icloud.split_enabled,
+  };
+}
+
 // 失败原因归类与恢复建议
 const FAIL_PATTERNS = [
   { re: /验证码|otp|code/i, label: "验证码" },
@@ -162,6 +174,39 @@ export default function Register() {
   const [gmailRenting, setGmailRenting] = useState(false);
   const [preparing, setPreparing] = useState(false);
   const [gmailNow, setGmailNow] = useState(Date.now());
+  // 非 Gmail 的邮箱来源 Provider（cf_temp_email / icloud），从邮箱配置读取并支持就地切换
+  const [mailProvider, setMailProvider] = useState("cf_temp_email");
+  const [mailProviderLoading, setMailProviderLoading] = useState(true);
+  // iCloud 剩余轮数预测：非分裂=未用池邮箱数；分裂=未耗尽基础邮箱数
+  const [icloudRounds, setIcloudRounds] = useState(null);
+  // 终态计数快照：变化才刷新剩余轮数（避免每 2s 轮询都拉全量配置）
+  const mailRoundsKeyRef = useRef("");
+  useEffect(() => {
+    let mounted = true;
+    api.mailConfig
+      .get()
+      .then((data) => {
+        if (!mounted) return;
+        setMailProvider(data?.provider || "cf_temp_email");
+        setIcloudRounds(readIcloudRounds(data));
+      })
+      .catch(() => {})
+      .finally(() => { if (mounted) setMailProviderLoading(false); });
+    return () => { mounted = false; };
+  }, []);
+  const switchMailProvider = async (provider) => {
+    if (running) return;
+    try {
+      const data = await api.mailConfig.save({ provider });
+      setMailProvider(provider);
+      setIcloudRounds(readIcloudRounds(data));
+      setGmailEnabled(false);
+      toast(`邮箱来源已切换为 ${provider === "icloud" ? "iCloud 邮箱池" : "Cloudflare 临时邮箱"}`, "success");
+    } catch (error) {
+      const firstLine = String(error?.message || "保存失败").split("\n")[0];
+      toast(`${firstLine}（可在「邮箱配置」页配置后重试）`, "error");
+    }
+  };
   const timerRef = useRef(null);
   const batchTimerRef = useRef(null);
   const batchActiveIdRef = useRef(null);
@@ -207,6 +252,20 @@ export default function Register() {
       setHistory(list);
       setHistoryLoading(false);
       setUpdatedAt(Date.now());
+      // 终态计数变化（有注册成功/失败）→ 刷新 iCloud 剩余轮数展示
+      const terminalKey = list.filter((r) => r.status === "success" || r.status === "failed").length;
+      if (terminalKey !== mailRoundsKeyRef.current) {
+        mailRoundsKeyRef.current = terminalKey;
+        api.mailConfig
+          .icloudRounds()
+          .then((data) => setIcloudRounds({
+            remaining: Number(data.remaining_rounds) || 0,
+            pool: Number(data.pool_size) || 0,
+            exhausted: Number(data.exhausted_roots) || 0,
+            split: !!data.split,
+          }))
+          .catch(() => {});
+      }
       // 优先恢复当前关注的批次；批次可能尚未创建第一条 registration，不能只靠历史记录找回。
       const latestWithBatch = list.find((r) => r.batch_id) || null;
       const trackedBatchId = batchActiveIdRef.current;
@@ -834,7 +893,7 @@ export default function Register() {
         <StatusItem label="当前任务" value={statusState.taskLabel || "无"} strong />
         <StatusItem label="模式" value={mode === "batch" || batchActive?.status === "running" ? "批量" : "单次"} />
         <StatusItem label="代理" value={proxy || "未设置"} />
-        <StatusItem label="邮箱来源" value={gmailEnabled ? "Gmail 会话池" : "普通"} />
+        <StatusItem label="邮箱来源" value={gmailEnabled ? "Gmail 会话池" : mailProvider === "icloud" ? "iCloud 邮箱池" : "CF 临时邮箱"} />
         <StatusItem label="headless" value={headless ? "是" : "否"} />
         <StatusItem label="bind_2fa" value={bind2FA ? "是" : "否"} />
         <div className="ml-auto flex items-center gap-2">
@@ -908,15 +967,54 @@ export default function Register() {
               )}
             </div>
 
-            {/* 高级设置：邮箱来源（Gmail 会话池不再是独立大卡片） */}
+            {/* 邮箱来源：Gmail 会话池 / CF 临时邮箱 / iCloud 邮箱池 */}
             <div className="border-t border-slate-100 px-3 py-2.5">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-1.5 text-xs font-medium text-slate-600">
-                  <Mail size={13} />邮箱来源
-                </div>
-                <Switch checked={gmailEnabled} onChange={setGmailEnabled}
-                  label={gmailEnabled ? "Gmail 会话池" : "普通邮箱"} disabled={running} />
+              <div className="flex items-center gap-1.5 text-xs font-medium text-slate-600">
+                <Mail size={13} />邮箱来源
               </div>
+              <div className="mt-2 grid grid-cols-3 gap-1.5">
+                {[
+                  { key: "gmail", label: "Gmail 会话池", active: gmailEnabled, onClick: () => setGmailEnabled(true) },
+                  { key: "cf", label: "CF 临时邮箱", active: !gmailEnabled && mailProvider !== "icloud", onClick: () => switchMailProvider("cf_temp_email") },
+                  { key: "icloud", label: "iCloud 邮箱池", active: !gmailEnabled && mailProvider === "icloud", onClick: () => switchMailProvider("icloud") },
+                ].map((item) => (
+                  <button
+                    key={item.key}
+                    type="button"
+                    disabled={running || mailProviderLoading}
+                    onClick={item.onClick}
+                    className={`rounded-md border px-2 py-1.5 text-[12px] font-medium transition-colors ${
+                      item.active
+                        ? "border-blue-500 bg-blue-50/60 text-blue-700"
+                        : "border-slate-200 bg-white text-slate-500 hover:border-slate-300 disabled:opacity-50"
+                    }`}
+                    title={item.key === "icloud" && !item.active ? "切到 iCloud 邮箱池（需在邮箱配置页启用并导入邮箱池）" : undefined}
+                  >
+                    {item.label}{item.active && <span className="ml-1">✓</span>}
+                  </button>
+                ))}
+              </div>
+              {!gmailEnabled && mailProvider === "icloud" && (
+                <div className="mt-2 flex items-center justify-between rounded-md bg-slate-50 px-2.5 py-2 text-xs">
+                  <span className="text-slate-500">
+                    剩余轮数
+                    <span className="ml-1 text-[10px] text-slate-400">
+                      {icloudRounds?.split ? "别名模式 · 按基础邮箱计" : "原邮箱模式 · 按池邮箱计"}
+                    </span>
+                  </span>
+                  <span className="tnum text-[13px] font-semibold">
+                    <span className={(icloudRounds?.remaining ?? 0) > 0 ? "text-emerald-600" : "text-red-500"}>
+                      {icloudRounds?.remaining ?? "—"}
+                    </span>
+                    {icloudRounds != null && (
+                      <span className="ml-1 text-[10px] font-normal text-slate-400">
+                        / {icloudRounds.pool}
+                        {icloudRounds.exhausted > 0 && ` · 耗尽 ${icloudRounds.exhausted}`}
+                      </span>
+                    )}
+                  </span>
+                </div>
+              )}
               {gmailEnabled && (
                 <div className="mt-2 space-y-2">
                   {!gmailSession ? (

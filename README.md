@@ -144,7 +144,7 @@ codex_register/
 │  │     ├─ link_extraction.py 提链任务编排
 │  │     ├─ link_browser.py / link_proxies.py 提链浏览器/出口轮换
 │  │     ├─ payment_link_extractor/  CS/OAICS Checkout、Stripe 支付链接提取
-│  │     ├─ mail_providers/    邮箱 Provider（CF临时邮箱 / Outlook）
+│  │     ├─ mail_providers/    邮箱 Provider（CF临时邮箱 / iCloud）
 │  │     └─ http_client.py / debug_capture.py / console_logging.py 等工具层
 │  ├─ scripts/                独立运维脚本（RT 批量刷新/OAuth 登录诊断等）
 │  ├─ tests/                  pytest 测试
@@ -177,7 +177,7 @@ codex_register/
 | `/api/link-extraction` | link_extraction | Checkout 支付链接提取 |
 | `/api/proxies` | proxies | 代理池管理 |
 | `/api/settings` | settings | 运行时配置读写 |
-| `/api/mail-config` | mail_config | 邮箱 Provider 配置（CF 临时邮箱 / Outlook / 自定义邮箱池） |
+| `/api/mail-config` | mail_config | 邮箱 Provider 配置（CF 临时邮箱 / iCloud / 自定义邮箱池） |
 | `/api/admin` | admin | 管理员登录与会话（可选，`ADMIN_AUTH_ENABLED` 开启） |
 | `/api/stats` | stats | 仪表盘统计 |
 | `/api/tasks` | tasks | 任务查询 |

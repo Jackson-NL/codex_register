@@ -22,7 +22,7 @@ from app.services.mail_providers.cf_temp_email import (
     validate_custom_pool,
 )
 from app.services.tempmail import TempmailClient, TempmailError
-from app.services.mail_providers.outlook import OutlookProvider, parse_outlook_pool, validate_outlook_pool
+from app.services.mail_providers.icloud import ICloudProvider, parse_icloud_pool, validate_icloud_pool
 
 
 def test_custom_pool_parser_normalizes_and_deduplicates_addresses():
@@ -225,43 +225,43 @@ def test_tempmail_cursor_ignores_old_fixed_inbox_codes(monkeypatch):
     assert asyncio.run(client.wait_for_code("jwt", timeout=1, poll_interval=0, after_mail_id=10)) == "222222"
 
 
-def test_validate_outlook_pool_accepts_supported_separators():
-    accounts, errors = validate_outlook_pool(
-        "first@example.com,first-secret\nsecond@example.com----second-secret"
+def test_validate_icloud_pool_accepts_mail_api_pairs():
+    accounts, errors = validate_icloud_pool(
+        "first@example.com----https://api.wdmail.top/m?\nsecond@example.com----https://api.wdmail.top/m?"
     )
 
     assert accounts == [
-        ("first@example.com", "first-secret"),
-        ("second@example.com", "second-secret"),
+        ("first@example.com", "https://api.wdmail.top/m?"),
+        ("second@example.com", "https://api.wdmail.top/m?"),
     ]
     assert errors == []
 
 
-def test_validate_outlook_pool_never_echoes_passwords_in_errors():
+def test_validate_icloud_pool_never_echoes_api_in_errors():
     secret = "do-not-echo-this-secret"
 
-    _, errors = validate_outlook_pool(f"not-an-email,{secret}")
+    _, errors = validate_icloud_pool(f"not-an-email----https://api.wdmail.top/m?{secret}")
 
     assert errors
     assert secret not in "\n".join(errors)
 
 
-def test_parse_outlook_pool_accepts_escaped_newlines_from_env():
-    assert parse_outlook_pool(
-        r"first@example.com,first-secret\nsecond@example.com,second-secret"
+def test_parse_icloud_pool_accepts_escaped_newlines_from_env():
+    assert parse_icloud_pool(
+        r"first@example.com----https://api.wdmail.top/m?\nsecond@example.com----https://api.wdmail.top/m?"
     ) == [
-        ("first@example.com", "first-secret"),
-        ("second@example.com", "second-secret"),
+        ("first@example.com", "https://api.wdmail.top/m?"),
+        ("second@example.com", "https://api.wdmail.top/m?"),
     ]
 
 
-def test_outlook_test_connection_rejects_invalid_pool_lines(monkeypatch):
-    monkeypatch.setattr(settings, "outlook_accounts_pool", "not-an-email,password")
+def test_icloud_test_connection_reports_empty_pool(monkeypatch):
+    monkeypatch.setattr(settings, "icloud_accounts_pool", "not-an-email----")
 
-    result = __import__("asyncio").run(OutlookProvider().test_connection())
+    result = __import__("asyncio").run(ICloudProvider().test_connection())
 
     assert result["ok"] is False
-    assert "邮箱格式" in result["message"]
+    assert "邮箱池为空" in result["message"]
 
 
 def test_partial_cf_update_keeps_existing_domain(monkeypatch):
@@ -289,16 +289,14 @@ def test_cf_update_rejects_url_without_host(monkeypatch):
 def test_mail_config_output_does_not_expose_sensitive_values(monkeypatch):
     secret = "super-secret-password"
     monkeypatch.setattr(settings, "cf_temp_email_site_password", secret)
-    monkeypatch.setattr(settings, "outlook_accounts_pool", f"first@example.com,{secret}")
-    monkeypatch.setattr(settings, "outlook_graph_client_secret", secret)
+    monkeypatch.setattr(settings, "icloud_accounts_pool", f"first@example.com----https://api.wdmail.top/m?{secret}")
 
     body = mail_config._config_out().model_dump()
     serialized = repr(body)
 
     assert secret not in serialized
     assert body["cf_temp_email"]["has_site_password"] is True
-    assert body["outlook"]["accounts_count"] == 1
-    assert body["outlook"]["has_graph_client_secret"] is True
+    assert body["icloud"]["accounts_count"] == 1
 
 
 def test_unknown_provider_is_not_silently_downgraded(monkeypatch):
@@ -308,11 +306,11 @@ def test_unknown_provider_is_not_silently_downgraded(monkeypatch):
         get_mail_provider()
 
 
-def test_disabled_outlook_default_provider_falls_back_to_cf_temp_email(monkeypatch):
-    """注册默认取 Provider 时，不应使用已停用的 Outlook 配置。"""
-    monkeypatch.setattr(settings, "mail_provider", "outlook")
-    monkeypatch.setattr(settings, "outlook_enabled", False)
-    monkeypatch.setattr(settings, "outlook_accounts_pool", "")
+def test_disabled_icloud_default_provider_falls_back_to_cf_temp_email(monkeypatch):
+    """注册默认取 Provider 时，不应使用已停用的 iCloud 配置。"""
+    monkeypatch.setattr(settings, "mail_provider", "icloud")
+    monkeypatch.setattr(settings, "icloud_enabled", False)
+    monkeypatch.setattr(settings, "icloud_accounts_pool", "")
     monkeypatch.setattr(settings, "cf_temp_email_enabled", True)
 
     provider = get_mail_provider()
@@ -320,18 +318,18 @@ def test_disabled_outlook_default_provider_falls_back_to_cf_temp_email(monkeypat
     assert isinstance(provider, CFTempEmailProvider)
 
 
-def test_mail_config_rejects_outlook_as_current_provider_when_disabled(monkeypatch):
+def test_mail_config_rejects_icloud_as_current_provider_when_disabled(monkeypatch):
     monkeypatch.setattr(settings, "mail_provider", "cf_temp_email")
-    monkeypatch.setattr(settings, "outlook_enabled", False)
-    monkeypatch.setattr(settings, "outlook_accounts_pool", "")
+    monkeypatch.setattr(settings, "icloud_enabled", False)
+    monkeypatch.setattr(settings, "icloud_accounts_pool", "")
     persisted = []
     monkeypatch.setattr(mail_config, "_persist_env", lambda *args: persisted.append(args))
 
-    with pytest.raises(Exception, match="Outlook Provider 未启用"):
-        mail_config.update_mail_config(MailConfigUpdate(provider="outlook"))
+    with pytest.raises(Exception, match="iCloud Provider 未启用"):
+        mail_config.update_mail_config(MailConfigUpdate(provider="icloud"))
 
     assert settings.mail_provider == "cf_temp_email"
-    assert ("mail_provider", "outlook") not in persisted
+    assert ("mail_provider", "icloud") not in persisted
 
 
 def test_cf_connection_test_redacts_sensitive_exception_text(monkeypatch):

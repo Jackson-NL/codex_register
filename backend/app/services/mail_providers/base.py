@@ -16,6 +16,10 @@ class MailProviderError(Exception):
     pass
 
 
+class MailProviderUnavailableError(MailProviderError):
+    """收信 API 本身不可用（网络异常 / 持续非 200 / 被拦截），区别于验证码等待超时。"""
+
+
 _SENSITIVE_PAIR_RE = re.compile(
     r"(?i)\b(jwt|token|password|secret|client_secret|authorization|x-custom-auth)\s*[:=]\s*([^\s,;]+)"
 )
@@ -66,24 +70,24 @@ def effective_mail_provider_name() -> str:
     """返回注册流程实际应使用的默认 Provider。
 
     允许配置页保存 Provider 草稿/历史值，但注册流程不能使用已停用的 Provider。
-    当前常见坏状态：MAIL_PROVIDER=outlook，同时 OUTLOOK_ENABLED=False，会导致
-    注册刚开始就报“Outlook 账号池为空”。这种情况下回退到启用的 cf_temp_email。
+    当前常见坏状态：MAIL_PROVIDER=icloud，同时 ICLOUD_ENABLED=False，会导致
+    注册刚开始就报“iCloud 邮箱池为空”。这种情况下回退到启用的 cf_temp_email。
     """
     name = (settings.mail_provider or "cf_temp_email").lower()
-    if name == "outlook" and not settings.outlook_enabled and settings.cf_temp_email_enabled:
+    if name == "icloud" and not settings.icloud_enabled and settings.cf_temp_email_enabled:
         return "cf_temp_email"
-    if name == "cf_temp_email" and not settings.cf_temp_email_enabled and settings.outlook_enabled:
-        return "outlook"
+    if name == "cf_temp_email" and not settings.cf_temp_email_enabled and settings.icloud_enabled:
+        return "icloud"
     return name
 
 
 def get_mail_provider(name: str | None = None) -> MailProvider:
     """按名称（默认当前启用 Provider）构建 Provider 实例。"""
     name = name.lower() if name else effective_mail_provider_name()
-    if name == "outlook":
-        from .outlook import OutlookProvider
+    if name == "icloud":
+        from .icloud import ICloudProvider
 
-        return OutlookProvider()
+        return ICloudProvider()
     if name == "cf_temp_email":
         from .cf_temp_email import CFTempEmailProvider
 

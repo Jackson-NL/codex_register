@@ -230,6 +230,7 @@ export const api = {
 
   mailConfig: {
     get: () => GET("/mail-config"),
+    icloudRounds: () => GET("/mail-config/icloud-rounds"),
     save: (body) => POST("/mail-config", body),
     test: (body) => POST("/mail-config/test", body),
     poolRequeue: (body) => POST("/mail-config/pool/requeue", body),

@@ -1,14 +1,17 @@
 """Codex OAuth 资格统一策略。
 
-规则默认 fail closed：只有 mail_provider == "gmail" 的账号才可能进入
-Codex OAuth；cf_temp_email / outlook / unknown 一律拒绝。前端候选过滤
-与后端所有 OAuth 入口都必须复用这里的判定，禁止各自用邮箱域名推断。
+规则默认 fail closed：只有 mail_provider 属于 OAUTH_ALLOWED_PROVIDERS 的账号
+（gmail / icloud）才可能进入 Codex OAuth；cf_temp_email / unknown 一律拒绝。
+前端候选过滤与后端所有 OAuth 入口都必须复用这里的判定，禁止各自用邮箱域名推断。
 """
 from datetime import datetime, timezone
 
 GMAIL_PROVIDER = "gmail"
+ICLOUD_PROVIDER = "icloud"
+OAUTH_ALLOWED_PROVIDERS = (GMAIL_PROVIDER, ICLOUD_PROVIDER)
 
-BLOCK_NOT_GMAIL = "仅 Gmail 来源账号允许进入 Codex OAuth"
+BLOCK_NOT_GMAIL = "仅 Gmail/icloud 来源账号允许进入 Codex OAuth"
+BLOCK_NOT_ALLOWED = BLOCK_NOT_GMAIL
 BLOCK_COOLING = "账号仍在冷却期，冷却结束前不能进入 Codex OAuth"
 BLOCK_NO_PROFILE = "缺少 profile"
 BLOCK_HAS_REFRESH_TOKEN = "已有 refresh_token"
@@ -46,8 +49,8 @@ def account_in_active_cooldown(account, *, now: datetime | None = None) -> bool:
 
 def oauth_block_reason(account) -> str:
     """返回空字符串表示允许进入 Codex OAuth，否则返回明确拒绝原因。"""
-    if normalized_mail_provider(account) != GMAIL_PROVIDER:
-        return BLOCK_NOT_GMAIL
+    if normalized_mail_provider(account) not in OAUTH_ALLOWED_PROVIDERS:
+        return BLOCK_NOT_ALLOWED
     if account_in_active_cooldown(account):
         return BLOCK_COOLING
     if not getattr(account, "profile_path", ""):

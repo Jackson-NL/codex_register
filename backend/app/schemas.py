@@ -334,7 +334,7 @@ class SettingsUpdate(BaseModel):
 
 class MailProviderName(str, Enum):
     cf_temp_email = "cf_temp_email"
-    outlook = "outlook"
+    icloud = "icloud"
 
 
 class CustomPoolItem(BaseModel):
@@ -376,29 +376,29 @@ class CFTempEmailConfig(BaseModel):
     has_site_password: bool = False
 
 
-class OutlookConfig(BaseModel):
-    """outlook 出参：不返回明文密码，只返回数量与脱敏样例。"""
+class ICloudConfig(BaseModel):
+    """icloud 出参：不返回收信 API 明文，只返回数量与脱敏样例。"""
 
     enabled: bool = False
     mode: str = "manual_pool"
     accounts_count: int = 0
     accounts_sample: list[str] = []
-    poll_interval: int = 5
+    poll_interval: int = 4
     poll_timeout: int = 180
-    sender_filter: str = ""
-    subject_filter: str = ""
-    imap_host: str = "outlook.office365.com"
-    imap_port: int = 993
-    imap_ssl: bool = True
-    graph_tenant_id: str = ""
-    graph_client_id: str = ""
-    has_graph_client_secret: bool = False
+    split_enabled: bool = False
+    split_prefix: str = ""
+    split_tag_length: int = 6
+    split_max_per_base: int = 0
+    # 剩余轮数预测（注册工作台展示）：非分裂=未用池邮箱数；分裂=未耗尽 root 数。
+    pool_size: int = 0
+    remaining_rounds: int = 0
+    exhausted_roots: int = 0
 
 
 class MailConfigOut(BaseModel):
     provider: str = "cf_temp_email"
     cf_temp_email: CFTempEmailConfig
-    outlook: OutlookConfig
+    icloud: ICloudConfig
     updated_at: str | None = None
     test_status: dict | None = None
 
@@ -424,28 +424,26 @@ class CFTempEmailUpdate(BaseModel):
     rate_limit_backoff: int | None = None
 
 
-class OutlookUpdate(BaseModel):
-    """outlook 入参：accounts_pool 明文只进不出；graph_client_secret 占位符不修改。"""
+class ICloudUpdate(BaseModel):
+    """icloud 入参：accounts_pool 明文只进不出（邮箱----收信API）。"""
 
     enabled: bool | None = None
     mode: str | None = None
     accounts_pool: str | None = None
+    # True 时 accounts_pool 只作增量与已保存池合并（已保存明文不回显，无法前端拼接）。
+    accounts_pool_append: bool | None = None
     poll_interval: int | None = None
     poll_timeout: int | None = None
-    sender_filter: str | None = None
-    subject_filter: str | None = None
-    imap_host: str | None = None
-    imap_port: int | None = None
-    imap_ssl: bool | None = None
-    graph_tenant_id: str | None = None
-    graph_client_id: str | None = None
-    graph_client_secret: str | None = None
+    split_enabled: bool | None = None
+    split_prefix: str | None = None
+    split_tag_length: int | None = None
+    split_max_per_base: int | None = None
 
 
 class MailConfigUpdate(BaseModel):
     provider: str | None = None
     cf_temp_email: CFTempEmailUpdate | None = None
-    outlook: OutlookUpdate | None = None
+    icloud: ICloudUpdate | None = None
 
 
 class MailConfigTestRequest(BaseModel):

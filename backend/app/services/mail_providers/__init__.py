@@ -10,7 +10,12 @@ from .cf_temp_email import (
     sync_custom_mailbox_pool,
     validate_custom_pool,
 )
-from .outlook import OutlookProvider, mask_outlook_sample, parse_outlook_pool, validate_outlook_pool
+from .icloud import (
+    ICloudProvider,
+    mask_icloud_sample,
+    parse_icloud_pool,
+    validate_icloud_pool,
+)
 
 __all__ = [
     "MailIdentity",
@@ -25,8 +30,8 @@ __all__ = [
     "release_custom_mailbox",
     "sync_custom_mailbox_pool",
     "validate_custom_pool",
-    "OutlookProvider",
-    "parse_outlook_pool",
-    "validate_outlook_pool",
-    "mask_outlook_sample",
+    "ICloudProvider",
+    "parse_icloud_pool",
+    "validate_icloud_pool",
+    "mask_icloud_sample",
 ]

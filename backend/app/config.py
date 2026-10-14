@@ -130,7 +130,7 @@ class Settings(BaseSettings):
     admin_login_max_attempts: int = 8
 
     # ---------- 邮箱 Provider 配置（独立邮箱配置模块） ----------
-    # 当前启用 Provider：cf_temp_email | outlook
+    # 当前启用 Provider：cf_temp_email | icloud
     mail_provider: str = "cf_temp_email"
 
     # Cloudflare 临时邮箱（cf_temp_email）
@@ -161,20 +161,26 @@ class Settings(BaseSettings):
     # 同一地址因「可证明未消费」被自动回收的最大次数，超过转 failed 防止死循环。
     custom_pool_max_recycle: int = 3
 
-    # Outlook（第一阶段以账号池 manual_pool 为主，imap/graph 仅预留）
-    outlook_enabled: bool = False
-    outlook_mode: str = "manual_pool"
-    outlook_accounts_pool: str = ""
-    outlook_poll_interval: int = 5
-    outlook_poll_timeout: int = 180
-    outlook_sender_filter: str = ""
-    outlook_subject_filter: str = ""
-    outlook_imap_host: str = "outlook.office365.com"
-    outlook_imap_port: int = 993
-    outlook_imap_ssl: bool = True
-    outlook_graph_tenant_id: str = ""
-    outlook_graph_client_id: str = ""
-    outlook_graph_client_secret: str = ""
+    # iCloud（wdmail 网页取件）邮箱池：注册用预置 @icloud.com 地址，
+    # 收信走每行「邮箱----API」里给出的 API（wdmail /m?f=json&e=xxx 返回验证码）。
+    icloud_enabled: bool = False
+    icloud_mode: str = "manual_pool"
+    # 每行一个账号：邮箱----收信API（API 为完整地址，如 https://api.wdmail.top/m?）
+    icloud_accounts_pool: str = ""
+    icloud_poll_interval: int = 4
+    icloud_poll_timeout: int = 180
+    # 分裂模式（纯别名）：打开后只注册 root+tag@域 的派生地址，原邮箱（基础地址）
+    # 本身不再分配；关闭时原样取池中的邮箱注册。
+    # 是否生效取决于收信服务是否做 + 别名归一(tongsheep 实测支持；yunapi 待验证)。
+    icloud_split_enabled: bool = False
+    icloud_split_prefix: str = ""
+    icloud_split_tag_length: int = 6
+    # 每个基础邮箱的最大产出数(基础地址+派生地址合计)；0=不限。
+    icloud_split_max_per_base: int = 0
+    # 「账号已注册」是否持久化标记（DB 拉黑该地址/root）。
+    # 登录页落地是真实信号，但共享邮箱池环境下判定归因存疑，默认关闭：
+    # 关闭时仍会秒级失败并跳过进入下一轮，仅不做永久拉黑。
+    icloud_persist_registered_marks: bool = False
 
 
 settings = Settings()

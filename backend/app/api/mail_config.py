@@ -13,13 +13,13 @@ from fastapi import APIRouter, HTTPException
 from ..config import BASE_DIR, settings
 from ..schemas import (
     CFTempEmailConfig,
+    ICloudConfig,
     MailConfigOut,
     MailConfigTestRequest,
     MailConfigUpdate,
-    OutlookConfig,
     PoolActionRequest,
 )
-from ..services.mail_providers import validate_outlook_pool
+from ..services.mail_providers import validate_icloud_pool
 from ..services.mail_providers.base import redact_error
 from .settings import _persist_env
 
@@ -34,16 +34,35 @@ _last_test: dict | None = None
 
 # ---------- 工具 ----------
 
-def _outlook_accounts() -> list[tuple[str, str]]:
-    from ..services.mail_providers import parse_outlook_pool
+def _icloud_accounts() -> list[tuple[str, str]]:
+    from ..services.mail_providers import parse_icloud_pool
 
-    return parse_outlook_pool(settings.outlook_accounts_pool)
+    return parse_icloud_pool(settings.icloud_accounts_pool)
 
 
 def _masked_samples() -> list[str]:
-    from ..services.mail_providers import mask_outlook_sample
+    from ..services.mail_providers import mask_icloud_sample
 
-    return [mask_outlook_sample(email) for email, _ in _outlook_accounts()[:3]]
+    return [mask_icloud_sample(email) for email, _ in _icloud_accounts()[:3]]
+
+
+def _icloud_remaining_fields() -> dict:
+    """剩余轮数预测字段（pool_size/remaining_rounds/exhausted_roots）。
+
+    估算依赖 DB（已注册账号）；任何异常降级为零值，不影响配置接口可用性。
+    """
+    try:
+        from ..services.mail_providers.icloud import estimate_remaining_rounds
+
+        estimate = estimate_remaining_rounds()
+        return {
+            "pool_size": int(estimate.get("pool_size") or 0),
+            "remaining_rounds": int(estimate.get("remaining") or 0),
+            "exhausted_roots": int(estimate.get("exhausted_roots") or 0),
+            "split": estimate.get("mode") == "split",
+        }
+    except Exception:  # noqa: BLE001
+        return {"pool_size": 0, "remaining_rounds": 0, "exhausted_roots": 0, "split": False}
 
 
 def _updated_at() -> str | None:
@@ -58,9 +77,9 @@ def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _persist_outlook_pool(value: str) -> None:
+def _persist_icloud_pool(value: str) -> None:
     # JSON quoting keeps multiline credentials in one valid dotenv assignment.
-    _persist_env("outlook_accounts_pool", json.dumps(value, ensure_ascii=True))
+    _persist_env("icloud_accounts_pool", json.dumps(value, ensure_ascii=True))
 
 
 def _persist_cf_custom_pool(value: str) -> None:
@@ -75,7 +94,7 @@ def _config_out() -> MailConfigOut:
     pool_snapshot = mail_pool.snapshot(custom_pool)
     custom_pool_status_counts = pool_snapshot["counts"]
     custom_pool_items = pool_snapshot["items"]
-    accounts = _outlook_accounts()
+    accounts = _icloud_accounts()
     return MailConfigOut(
         provider=settings.mail_provider or "cf_temp_email",
         cf_temp_email=CFTempEmailConfig(
@@ -98,21 +117,18 @@ def _config_out() -> MailConfigOut:
             rate_limit_backoff=settings.cf_temp_email_rate_limit_backoff,
             has_site_password=bool(settings.cf_temp_email_site_password),
         ),
-        outlook=OutlookConfig(
-            enabled=settings.outlook_enabled,
-            mode=settings.outlook_mode or "manual_pool",
+        icloud=ICloudConfig(
+            enabled=settings.icloud_enabled,
+            mode=settings.icloud_mode or "manual_pool",
             accounts_count=len(accounts),
             accounts_sample=_masked_samples(),
-            poll_interval=settings.outlook_poll_interval,
-            poll_timeout=settings.outlook_poll_timeout,
-            sender_filter=settings.outlook_sender_filter,
-            subject_filter=settings.outlook_subject_filter,
-            imap_host=settings.outlook_imap_host,
-            imap_port=settings.outlook_imap_port,
-            imap_ssl=settings.outlook_imap_ssl,
-            graph_tenant_id=settings.outlook_graph_tenant_id,
-            graph_client_id=settings.outlook_graph_client_id,
-            has_graph_client_secret=bool(settings.outlook_graph_client_secret),
+            poll_interval=settings.icloud_poll_interval,
+            poll_timeout=settings.icloud_poll_timeout,
+            split_enabled=settings.icloud_split_enabled,
+            split_prefix=settings.icloud_split_prefix or "",
+            split_tag_length=settings.icloud_split_tag_length or 6,
+            split_max_per_base=settings.icloud_split_max_per_base or 0,
+            **_icloud_remaining_fields(),
         ),
         updated_at=_updated_at(),
         test_status=_last_test,
@@ -143,14 +159,24 @@ def get_mail_config():
     return _config_out()
 
 
+@router.get("/icloud-rounds")
+def get_icloud_rounds():
+    """轻量轮询端点：只返回 iCloud 剩余轮数预测。
+
+    完整 mail-config 响应带 432 条 custom_pool_items（~150KB），不适合
+    2s 级轮询；注册工作台的剩余轮数刷新走这里。
+    """
+    return _icloud_remaining_fields()
+
+
 @router.post("", response_model=MailConfigOut)
 def update_mail_config(payload: MailConfigUpdate):
     requested_provider = payload.provider.lower() if payload.provider is not None else None
-    if requested_provider is not None and requested_provider not in ("cf_temp_email", "outlook"):
+    if requested_provider is not None and requested_provider not in ("cf_temp_email", "icloud"):
         raise HTTPException(422, "不支持的邮箱 Provider")
 
     # 先保存各 Provider 具体配置，再在末尾决定当前启用 Provider。
-    # 这样允许同一次请求提交 outlook.enabled/accounts_pool 后再切换 provider。
+    # 这样允许同一次请求提交 icloud.enabled/accounts_pool 后再切换 provider。
     if payload.cf_temp_email is not None:
         data = payload.cf_temp_email.model_dump(exclude_none=True)
         _validate_cf_common(data)
@@ -212,33 +238,40 @@ def update_mail_config(payload: MailConfigUpdate):
             settings.cf_temp_email_site_password = site_password
             _persist_env("cf_temp_email_site_password", site_password)
 
-    if payload.outlook is not None:
-        data = payload.outlook.model_dump(exclude_none=True)
+    if payload.icloud is not None:
+        data = payload.icloud.model_dump(exclude_none=True)
         accounts_pool = data.pop("accounts_pool", None)
-        # 账号池：保存前解析校验，格式错误明确报错
+        accounts_pool_append = bool(data.pop("accounts_pool_append", None))
+        # 账号池：保存前解析校验（邮箱----收信API），格式错误明确报错
         if accounts_pool is not None:
-            _, errors = validate_outlook_pool(accounts_pool)
+            from ..services.mail_providers import parse_icloud_pool
+
+            _, errors = validate_icloud_pool(accounts_pool)
             if errors:
                 raise HTTPException(422, "账号池格式错误：\n" + "\n".join(errors))
-            settings.outlook_accounts_pool = accounts_pool
-            _persist_outlook_pool(accounts_pool)
-        graph_secret = data.pop("graph_client_secret", None)
+            if accounts_pool_append:
+                merged = parse_icloud_pool(settings.icloud_accounts_pool)
+                seen = {email for email, _ in merged}
+                for email, api in parse_icloud_pool(accounts_pool):
+                    if email not in seen:
+                        merged.append((email, api))
+                        seen.add(email)
+                accounts_pool = "\n".join(f"{email}----{api}" for email, api in merged)
+            settings.icloud_accounts_pool = accounts_pool
+            _persist_icloud_pool(accounts_pool)
         for key, value in data.items():
-            setattr(settings, f"outlook_{key}", value)
-            _persist_env(f"outlook_{key}", value)
-        if graph_secret and graph_secret != _MASK:
-            settings.outlook_graph_client_secret = graph_secret
-            _persist_env("outlook_graph_client_secret", graph_secret)
+            setattr(settings, f"icloud_{key}", value)
+            _persist_env(f"icloud_{key}", value)
 
     if requested_provider is not None:
-        if requested_provider == "outlook":
-            if not settings.outlook_enabled:
-                raise HTTPException(422, "Outlook Provider 未启用，不能设为当前注册邮箱")
-            accounts, errors = validate_outlook_pool(settings.outlook_accounts_pool)
+        if requested_provider == "icloud":
+            if not settings.icloud_enabled:
+                raise HTTPException(422, "iCloud Provider 未启用，不能设为当前注册邮箱")
+            accounts, errors = validate_icloud_pool(settings.icloud_accounts_pool)
             if errors:
-                raise HTTPException(422, "Outlook 账号池格式错误：\n" + "\n".join(errors))
+                raise HTTPException(422, "iCloud 账号池格式错误：\n" + "\n".join(errors))
             if not accounts:
-                raise HTTPException(422, "Outlook 账号池为空，不能设为当前注册邮箱")
+                raise HTTPException(422, "iCloud 账号池为空，不能设为当前注册邮箱")
         if requested_provider == "cf_temp_email" and not settings.cf_temp_email_enabled:
             raise HTTPException(422, "cf_temp_email Provider 未启用，不能设为当前注册邮箱")
         settings.mail_provider = requested_provider
@@ -269,14 +302,14 @@ async def test_mail_config(payload: MailConfigTestRequest):
         if cf.get("inbox_jwt") not in (None, "", _MASK):
             overrides["inbox_jwt"] = str(cf["inbox_jwt"])
         provider = CFTempEmailProvider(**overrides)
-    elif provider_name == "outlook":
-        from ..services.mail_providers import OutlookProvider
+    elif provider_name == "icloud":
+        from ..services.mail_providers import ICloudProvider
 
         overrides = {}
-        out = config.get("outlook") or config
-        if out.get("accounts_pool") is not None:
-            overrides["accounts_pool"] = str(out["accounts_pool"])
-        provider = OutlookProvider(**overrides)
+        ic = config.get("icloud") or config
+        if ic.get("accounts_pool") is not None:
+            overrides["accounts_pool"] = str(ic["accounts_pool"])
+        provider = ICloudProvider(**overrides)
     else:
         raise HTTPException(422, "不支持的邮箱 Provider")
 

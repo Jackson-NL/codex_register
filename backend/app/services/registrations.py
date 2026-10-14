@@ -440,6 +440,56 @@ class RegistrationService:
                 if reg:
                     reg.status = "failed"
                     reg.error = safe_msg
+                    # iCloud 终局标记：OpenAI 判定「账号可能已存在」=该基础邮箱别名
+                    # 已达上限，标记 root 耗尽，后续轮换跳过该基础邮箱。
+                    # 「账号已注册」的持久拉黑受 icloud_persist_registered_marks
+                    # 控制（默认关，共享池归因存疑）。reg.mail_provider 列常为空，
+                    # 判定用全局当前 provider。
+                    mark_source = ""
+                    if settings.mail_provider == "icloud":
+                        try:
+                            draft_email = (reg.email or "").strip()
+                            if not draft_email:
+                                try:
+                                    draft = json.loads(reg.result_json or "{}")
+                                    draft_email = (
+                                        draft.get("email") or draft.get("address") or draft.get("mail_address") or ""
+                                    ).strip()
+                                except Exception:  # noqa: BLE001
+                                    draft_email = ""
+                            mark_source = draft_email
+                        except Exception:  # noqa: BLE001
+                            mark_source = ""
+                    if settings.mail_provider == "icloud" and "可能已存在" in safe_msg and mark_source:
+                        try:
+                            from .registrator import emit_log
+                            from .mail_providers.icloud import _split_root, mark_root_exhausted
+
+                            root = _split_root(mark_source)
+                            mark_root_exhausted(root)
+                            emit_log(
+                                f"[registration:{reg_id}] [split] 触发「账号可能已存在」 "
+                                f"(address={mark_source})，root={root} 已标记耗尽，后续轮换跳过"
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if (
+                        settings.mail_provider == "icloud"
+                        and settings.icloud_persist_registered_marks
+                        and "账号已注册" in safe_msg
+                        and mark_source
+                    ):
+                        try:
+                            from .registrator import emit_log
+                            from .mail_providers.icloud import mark_email_registered
+
+                            if mark_email_registered(mark_source):
+                                emit_log(
+                                    f"[registration:{reg_id}] [icloud] 账号已注册 "
+                                    f"(address={mark_source})，已持久标记，后续分配跳过"
+                                )
+                        except Exception:  # noqa: BLE001
+                            pass
                     if isinstance(exc, VerificationTimeoutError) and reg.gmail_alias and reg.gmail_mail_id:
                         try:
                             streak, canceled, cancel_error = await _record_gmail_otp_timeout(db, reg)

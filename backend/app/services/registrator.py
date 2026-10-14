@@ -659,6 +659,16 @@ class OpenAIErrorPageError(RegisterError):
         super().__init__("page_error", f"{label}: {detail}")
 
 
+class EmailAlreadyRegisteredError(RegisterError):
+    """邮箱已注册：密码阶段被 OpenAI 甩到登录页（login_password）。
+
+    该地址已有账号——终局，不换邮箱重试；由调用方标记并跳过。
+    """
+    def __init__(self, address: str = ""):
+        detail = f"（{address}）" if address else ""
+        super().__init__("email", f"账号已注册{detail}：密码阶段跳转登录页，该邮箱已有 OpenAI 账号")
+
+
 class WrongPhaseError(RegisterError):
     """页面阶段与预期不符"""
     def __init__(self, stage: str, expected: str, actual: str, url: str, detail: str = ""):
@@ -2164,6 +2174,57 @@ async def wait_for_page_transition(page, previous_url: str, patterns: list[str],
             return page.url
         await asyncio.sleep(0.5)
     return page.url
+
+
+def _mark_icloud_root_exhausted(retry_ctx: dict | None) -> str:
+    """iCloud 终局标记：把本轮用过的邮箱地址归一到 root 并标记耗尽。
+
+    仅当前邮箱 Provider 为 icloud 时生效；返回 root，其余情况返回空串。
+    标记内存 + DB 双写（icloud.mark_root_exhausted），重启后仍跳过该邮箱
+    的全部别名，不再撞同一堵「账号可能已存在」的墙。
+    """
+    if str(getattr(settings, "mail_provider", "") or "").lower() != "icloud":
+        return ""
+    address = str((retry_ctx or {}).get("email") or "").strip()
+    if not address:
+        return ""
+    try:
+        from .mail_providers.icloud import _split_root, mark_root_exhausted
+
+        root = _split_root(address)
+        mark_root_exhausted(root)
+        return root
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _is_already_registered_error(error: BaseException) -> bool:
+    """邮箱已注册特征：流程被甩到登录页（login_password）。
+
+    覆盖非密码提交路径（如 Continue with password 后直接落登录页）——
+    异常消息里带 实际[login_password] 即判定该邮箱已有账号。
+    """
+    return "login_password" in str(error)
+
+
+def _mark_icloud_email_registered(retry_ctx: dict | None) -> str:
+    """iCloud 终局标记：把本轮地址标记为「账号已注册」并返回该地址。
+
+    仅当前邮箱 Provider 为 icloud 时生效；内存 + DB 双写
+    （icloud.mark_email_registered），重启后分配不再取出该地址。
+    """
+    if str(getattr(settings, "mail_provider", "") or "").lower() != "icloud":
+        return ""
+    address = str((retry_ctx or {}).get("email") or "").strip()
+    if not address:
+        return ""
+    try:
+        from .mail_providers.icloud import mark_email_registered
+
+        mark_email_registered(address)
+        return address
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 class Registrator:
@@ -4612,12 +4673,34 @@ class Registrator:
 
         for attempt in range(max_retries):
             try:
-                return await self._register_by_email_once(
-                    proxy, profile_path, client_id, redirect_uri, headless=headless, bind_totp=bind_totp,
-                    gmail_alias=gmail_alias, gmail_mail_id=gmail_mail_id, preset_password=preset_password,
-                    retry_ctx=retry_ctx, live_update=live_update, debug_wait=debug_wait, debug_trace=debug_trace,
-                    debug_should_pause=lambda error, attempt=attempt: should_pause_debug(error, attempt),
+                try:
+                    return await self._register_by_email_once(
+                        proxy, profile_path, client_id, redirect_uri, headless=headless, bind_totp=bind_totp,
+                        gmail_alias=gmail_alias, gmail_mail_id=gmail_mail_id, preset_password=preset_password,
+                        retry_ctx=retry_ctx, live_update=live_update, debug_wait=debug_wait, debug_trace=debug_trace,
+                        debug_should_pause=lambda error, attempt=attempt: should_pause_debug(error, attempt),
+                    )
+                except EmailAlreadyRegisteredError:
+                    raise
+                except (WrongPhaseError, PageStuckError) as error:
+                    # 兜底转换：任何路径漂到登录页（login_password）= 邮箱已注册，
+                    # 统一转成终局异常，由下面分支标记 + 跳过。
+                    if _is_already_registered_error(error):
+                        raise EmailAlreadyRegisteredError(
+                            str((retry_ctx or {}).get("email") or "")
+                        ) from error
+                    raise
+            except EmailAlreadyRegisteredError as error:
+                # 终局：该邮箱已有账号。标记 + 跳过，不换邮箱重试——
+                # 换邮箱重试只会再烧一个浏览器会话，而地址不记下来还会复发。
+                last_error = error
+                address = _mark_icloud_email_registered(retry_ctx)
+                suffix = f"（{address} 已标记，后续分配跳过）" if address else ""
+                emit_log(
+                    f"[worker] 账号已注册{suffix}，不换邮箱重试，直接进入下一轮: {error}",
+                    flush=True,
                 )
+                raise
             except ProxyNetworkError as error:
                 # 连接重置发生在代理传输层，不能按 Gmail 普通注册错误直接结束，
                 # 也不能在 debug 模式暂停浏览器；先换出口，再复用本轮凭证重试。
@@ -4775,6 +4858,31 @@ class Registrator:
                     raise
                 emit_log(f"[worker] 会话提取失败: {error} ({attempt + 1}/{max_retries})", flush=True)
                 continue
+            except OpenAIErrorPageError as error:
+                # OpenAI 应用错误页。其中「账号可能已存在」是终局：该主邮箱的
+                # 别名空间已被 OpenAI 判定占用，换新别名重试只是重复烧浏览器
+                # 会话（旧行为要重试到上限才在 registrations.py 标记 root）。
+                # 立即标记 root 耗尽并结束本轮，批量协调器直接进下一轮。
+                last_error = error
+                if PAGE_ERROR_ACCOUNT_EXISTS in str(error):
+                    if gmail_order_mode:
+                        abort_gmail_retry(error, "遇到账号可能已存在")
+                        raise
+                    root = _mark_icloud_root_exhausted(retry_ctx)
+                    suffix = f"（root={root}，该邮箱后续别名全部跳过）" if root else ""
+                    emit_log(
+                        f"[worker] 账号可能已存在{suffix}，不换别名重试，直接进入下一轮: {error}",
+                        flush=True,
+                    )
+                    raise
+                emit_log(f"[worker] OpenAI 错误页({error.stage}): {error}", flush=True)
+                if attempt < max_retries - 1:
+                    if gmail_order_mode:
+                        abort_gmail_retry(error, "遇到 OpenAI 错误页")
+                        raise
+                    emit_log(f"[worker] OpenAI 错误页，换新邮箱重试 ({attempt + 1}/{max_retries})", flush=True)
+                    continue
+                raise
             except RegisterError as error:
                 last_error = error
                 emit_log(f"[worker] 邮箱注册失败({error.stage}): {error}", flush=True)
@@ -5618,7 +5726,7 @@ class Registrator:
                 gmail_ignore_code = ""
             emit_log(f"[trace] Gmail 会话模式: {address}")
         else:
-            # 统一邮箱 Provider：cf_temp_email（默认）/ outlook，配置来自邮箱配置模块
+            # 统一邮箱 Provider：cf_temp_email（默认）/ icloud，配置来自邮箱配置模块
             mail_provider = get_mail_provider()
             mail_identity = await mail_provider.create_address()
             address = mail_identity.address
@@ -5873,6 +5981,10 @@ class Registrator:
                 state = await probe_page(page)
                 emit_log(f"[stage:password] 密码提交后 phase={state['phase']} url={state['url'][:120]}", flush=True)
                 raise_if_challenge(state, "设密码后")
+                if state["phase"] == PHASE_LOGIN_PASSWORD:
+                    # 密码提交后被甩到登录页 = 该邮箱已注册（OpenAI 引导登录而非建号）。
+                    # 秒级判定，不再干等 60s 卡住超时。
+                    raise EmailAlreadyRegisteredError(address)
                 if state["phase"] not in (PHASE_EMAIL_VERIFICATION, PHASE_ABOUT_YOU, PHASE_CHATGPT_HOME):
                     # 密码提交偶发未跳转：再点一次提交并等待
                     emit_log(f"[trace] 设密码后仍停留在[{state['phase']}] {state['url'][:90]}，重试提交", flush=True)

@@ -102,9 +102,10 @@ class OAuthPolicyTests(unittest.TestCase):
         reason = oauth_block_reason(_account(mail_provider="cf_temp_email"))
         self.assertEqual(reason, BLOCK_NOT_GMAIL)
 
-    def test_outlook_is_rejected(self):
-        reason = oauth_block_reason(_account(mail_provider="outlook"))
-        self.assertEqual(reason, BLOCK_NOT_GMAIL)
+    def test_icloud_is_allowed_without_rt_and_profile(self):
+        account = _account(mail_provider="icloud")
+        self.assertEqual(oauth_block_reason(account), "")
+        self.assertTrue(oauth_eligibility(account)["oauth_eligible"])
 
     def test_unknown_is_rejected(self):
         for provider in ("unknown", "", None):
@@ -542,7 +543,7 @@ class RegistrationMailProviderTests(unittest.TestCase):
             cf_reg = db.get(Registration, cf_reg_id)
             self.assertEqual(gmail_reg.mail_provider, "gmail")
             # 非 Gmail 订单使用当前生效 Provider（测试环境默认配置为非 gmail）。
-            self.assertIn(cf_reg.mail_provider, {"cf_temp_email", "outlook"})
+            self.assertIn(cf_reg.mail_provider, {"cf_temp_email", "icloud"})
             self.assertNotEqual(cf_reg.mail_provider, "gmail")
         finally:
             db.close()
