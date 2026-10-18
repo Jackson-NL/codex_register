@@ -238,6 +238,24 @@ export default function Register() {
     batchActiveIdRef.current = batchActive?.id || null;
   }, [batchActive?.id]);
 
+  // 定时刷新 iCloud 剩余轮数：跑任务时(取号/注册/收码)剩余额度持续变化，4s 轮询保持实时。
+  useEffect(() => {
+    const refreshRounds = () => {
+      api.mailConfig
+        .icloudRounds()
+        .then((data) => setIcloudRounds({
+          remaining: Number(data.remaining_rounds) || 0,
+          pool: Number(data.pool_size) || 0,
+          exhausted: Number(data.exhausted_roots) || 0,
+          split: !!data.split,
+        }))
+        .catch(() => {});
+    };
+    refreshRounds();
+    const timer = setInterval(refreshRounds, 4000);
+    return () => clearInterval(timer);
+  }, []);
+
   // 任务不存在提示只打印一次
   const noticeTaskMissing = (label) => {
     if (missingNoticeRef.current[label]) return;
@@ -999,7 +1017,7 @@ export default function Register() {
                   <span className="text-slate-500">
                     剩余轮数
                     <span className="ml-1 text-[10px] text-slate-400">
-                      {icloudRounds?.split ? "别名模式 · 按基础邮箱计" : "原邮箱模式 · 按池邮箱计"}
+                      {icloudRounds?.split ? "别名模式" : "原邮箱模式"} · 按实际可分配额度计
                     </span>
                   </span>
                   <span className="tnum text-[13px] font-semibold">

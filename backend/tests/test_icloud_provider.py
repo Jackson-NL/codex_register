@@ -163,6 +163,65 @@ def test_wait_for_code_survives_intermittent_api_failures(monkeypatch):
     assert asyncio.run(provider.wait_for_code(_identity(), timeout=10)) == "445566"
 
 
+def test_wait_for_code_tolerates_transient_blip_around_mail_arrival(monkeypatch):
+    """邮件到达瞬间服务商接口短暂失败（历史 12s 提前放弃的现场）：
+
+    前 7 次失败、第 8 次返回验证码 → 必须等到码，不能被当成「接口挂了」快速放弃。
+    """
+    calls = {"n": 0}
+
+    def handler(_request):
+        calls["n"] += 1
+        if calls["n"] < 8:
+            raise httpx.ConnectError("transient during mail arrival")
+        return httpx.Response(200, json={"success": True, "code": "778899"})
+
+    _patch_mail_client(monkeypatch, handler)
+    provider = ICloudProvider(poll_interval=0.01)
+
+    code = asyncio.run(provider.wait_for_code(_identity(), timeout=30))
+
+    assert code == "778899"
+    assert calls["n"] == 8
+
+
+def test_wait_for_code_fails_fast_after_eight_consecutive_failures(monkeypatch):
+    """快速放弃保护仍在，但要等足 8 次连续失败（≈32s 而非旧 3 次≈12s）才判接口不可用。"""
+    calls = {"n": 0}
+
+    def handler(_request):
+        calls["n"] += 1
+        raise httpx.ConnectError("down")
+
+    _patch_mail_client(monkeypatch, handler)
+    provider = ICloudProvider(poll_interval=0.01, poll_timeout=120)
+
+    with pytest.raises(MailProviderUnavailableError, match="连续 8"):
+        asyncio.run(provider.wait_for_code(_identity()))
+
+    assert calls["n"] == 8
+
+
+def test_wait_for_code_waits_full_timeout_when_api_healthy(monkeypatch):
+    """接口健康返回 success:false（码还没到）时必须等满 timeout 再报普通超时，
+
+    不能误判成「接口不可用」提前退出——这正是真实注册现场（yunapi 在码未到时
+    正常返回 success:false）应走的分支。
+    """
+    _patch_mail_client(
+        monkeypatch,
+        lambda _r: httpx.Response(200, json={"success": False, "code": ""}),
+    )
+    provider = ICloudProvider(poll_interval=0.01, poll_timeout=2)
+    started = time.monotonic()
+
+    with pytest.raises(MailProviderError, match="超时") as exc_info:
+        asyncio.run(provider.wait_for_code(_identity()))
+
+    assert not isinstance(exc_info.value, MailProviderUnavailableError)
+    assert time.monotonic() - started >= 1.5
+
+
 def test_wait_for_code_times_out_when_api_healthy_but_no_mail(monkeypatch):
     _patch_mail_client(
         monkeypatch,
@@ -415,11 +474,12 @@ def test_estimate_remaining_rounds_manual_pool_excludes_exhausted_root():
         _cleanup_exhausted_root(emails[0].partition("@")[0])
 
 
-def test_estimate_remaining_rounds_split_counts_distinct_roots():
+def test_estimate_remaining_rounds_split_counts_families():
+    """家族口径：同一家族的池行/别名只算 1 轮（OpenAI 对 + 别名做家族归一）。"""
     token = uuid4().hex[:8]
     root_a = f"est-sroot-{token}-a"
     root_b = f"est-sroot-{token}-b"
-    # 同一 root 的两行（原地址 + 旧手动别名）只计 1 轮
+    # {a}@ 与 {a}+old1@ 属同一家族（第一个 + 之前相同）→ 只算 1 轮；{b} 另算 1 轮
     pool = "\n".join(
         [
             _split_pool_line(f"{root_a}@example.com"),
@@ -563,3 +623,160 @@ def test_mark_icloud_email_registered_helper(monkeypatch):
         assert email in icloud._KNOWN_REGISTERED
     finally:
         _cleanup_known_registered(email)
+
+
+# ---------------------------------------------------------------- 等码超时标记
+
+
+def _cleanup_code_timeout(email: str) -> None:
+    from app.db import SessionLocal
+    from app.models import IcloudCodeTimeout
+
+    db = SessionLocal()
+    try:
+        db.query(IcloudCodeTimeout).filter(IcloudCodeTimeout.email == email).delete()
+        db.commit()
+    finally:
+        db.close()
+    icloud._CODE_TIMEOUTS.discard(email)
+
+
+def test_mark_code_timeout_survives_restart_via_db():
+    """等码超时单次即永久跳过：重启（清内存）后分配仍跳过该地址。"""
+    token = uuid4().hex[:8]
+    email = f"code-timeout-{token}@example.com"
+    provider = ICloudProvider(accounts_pool=_split_pool_line(email), split_enabled=False)
+    try:
+        assert icloud.mark_code_timeout(email) is True
+
+        # 模拟进程重启：内存集合与懒加载标记全部清空
+        icloud._CODE_TIMEOUTS.clear()
+        icloud._CODE_TIMEOUTS_LOADED = False
+
+        with pytest.raises(MailProviderError, match="已无可分配邮箱"):
+            asyncio.run(provider.create_address())
+    finally:
+        _cleanup_code_timeout(email)
+        _cleanup_exhausted_root(f"code-timeout-{token}")
+
+
+def test_mark_code_timeout_exhausts_original_mailbox(monkeypatch):
+    """超时必须连原邮箱一起耗尽：同一原邮箱共用收信 API，兄弟别名收不到同样收不到。
+
+    只标别名的话 10 分钟窗一过就又生成新别名、再烧 3 分钟等码
+    （实测 salvo.swarm6l+ba67 连烧 4 个别名）。
+    """
+    from app.config import settings
+
+    token = uuid4().hex[:8]
+    local = f"code-plus-{token}"
+    original = f"{local}+ff22"
+    email = f"{original}+abc123@example.com"
+    monkeypatch.setattr(settings, "icloud_accounts_pool", _split_pool_line(f"{original}@example.com"))
+    try:
+        assert icloud.mark_code_timeout(email) is True
+        assert email in icloud._CODE_TIMEOUTS
+        assert original in icloud._EXHAUSTED_ROOTS
+
+        provider = ICloudProvider(accounts_pool=_split_pool_line(f"{original}@example.com"), split_enabled=True)
+        with pytest.raises(MailProviderError, match="无可用基础邮箱"):
+            asyncio.run(provider.create_address())
+    finally:
+        _cleanup_code_timeout(email)
+        _cleanup_exhausted_root(original)
+
+
+def test_estimate_remaining_rounds_excludes_code_timeouts():
+    token = uuid4().hex[:8]
+    emails = [f"est-timeout-{token}-{i}@example.com" for i in range(3)]
+    provider = ICloudProvider(
+        accounts_pool="\n".join(_split_pool_line(e) for e in emails),
+        split_enabled=False,
+    )
+    icloud.mark_code_timeout(emails[0])
+    try:
+        result = icloud.estimate_remaining_rounds(provider)
+        assert result["remaining"] == 2
+    finally:
+        _cleanup_code_timeout(emails[0])
+
+
+def test_mark_icloud_code_timeout_helper(monkeypatch):
+    from app.config import settings
+    from app.services.registrator import _mark_icloud_code_timeout
+
+    token = uuid4().hex[:8]
+    email = f"helper-timeout-{token}@example.com"
+    try:
+        monkeypatch.setattr(settings, "mail_provider", "cf_temp_email")
+        assert _mark_icloud_code_timeout({"email": email}) == ""
+        assert email not in icloud._CODE_TIMEOUTS
+
+        monkeypatch.setattr(settings, "mail_provider", "icloud")
+        assert _mark_icloud_code_timeout({}) == ""
+        assert _mark_icloud_code_timeout({"email": email}) == email
+        assert email in icloud._CODE_TIMEOUTS
+    finally:
+        _cleanup_code_timeout(email)
+        _cleanup_exhausted_root(f"helper-timeout-{token}")
+
+
+# ---------------------------------------------------------------- 追加式别名（原邮箱+xxx）
+
+
+def test_split_address_appends_to_full_local_part():
+    """池行（含自带 + 段）即原邮箱：别名 = 完整本地部分 + '+tag'。
+
+    reg: salvo.swarm6l+ba67@icloud.com → 别名 salvo.swarm6l+ba67+xxx@icloud.com
+    （旧实现会剥掉 +ba67 再换新 tag，属误伤同一原邮箱的手写别名）。
+    """
+    token = uuid4().hex[:8]
+    original = f"salvo-{token}+ba67@example.com"
+    provider = ICloudProvider(accounts_pool=_split_pool_line(original), split_enabled=True, split_tag_length=6)
+    identity = asyncio.run(provider.create_address())
+    assert identity.address.startswith(f"salvo-{token}+ba67+")
+    assert identity.address.endswith("@example.com")
+    assert identity.address != original
+    assert identity.meta["root"] == f"salvo-{token}+ba67"
+
+
+def test_resolve_original_mailbox_uses_longest_pool_prefix(monkeypatch):
+    """派生别名必须归一到池中最长前缀匹配的原邮箱（不能盲剥段）。"""
+    from app.config import settings
+
+    token = uuid4().hex[:8]
+    short = f"resolve-{token}"
+    long = f"resolve-{token}+ba67"
+    pool = "\n".join(
+        [
+            _split_pool_line(f"{short}@example.com"),
+            _split_pool_line(f"{long}@example.com"),
+        ]
+    )
+    monkeypatch.setattr(settings, "icloud_accounts_pool", pool)
+
+    assert icloud._resolve_original_mailbox(f"{long}+abc123@example.com") == long
+    assert icloud._resolve_original_mailbox(f"{short}+zzz999@example.com") == short
+    assert icloud._resolve_original_mailbox(f"{long}@example.com") == long
+    # 不在池中：退化为剥掉最后一段
+    assert icloud._resolve_original_mailbox(f"unknown-{token}+tag1@example.com") == f"unknown-{token}"
+
+
+def test_mark_root_exhausted_resolves_derived_alias_to_original(monkeypatch):
+    """分裂模式下用派生别名触发「账号可能已存在」：必须耗尽池中的原邮箱。"""
+    from app.config import settings
+
+    token = uuid4().hex[:8]
+    original = f"burn-{token}+ba67"
+    pool = _split_pool_line(f"{original}@example.com")
+    monkeypatch.setattr(settings, "icloud_accounts_pool", pool)
+    provider = ICloudProvider(accounts_pool=pool, split_enabled=True)
+    try:
+        # 模拟注册地址是派生别名
+        assert icloud.mark_root_exhausted(f"{original}+k3x9qm@example.com") is True
+        assert original in icloud._EXHAUSTED_ROOTS
+
+        with pytest.raises(MailProviderError, match="无可用基础邮箱"):
+            asyncio.run(provider.create_address())
+    finally:
+        _cleanup_exhausted_root(original)

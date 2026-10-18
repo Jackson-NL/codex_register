@@ -69,6 +69,9 @@ def resolve_rotation_target() -> dict:
             "region_keywords": str(
                 settings.oauth_clash_allowed_region_keywords or settings.clash_allowed_region_keywords or ""
             ).strip(),
+            "node_keywords": str(
+                settings.oauth_clash_allowed_node_keywords or settings.clash_allowed_node_keywords or ""
+            ).strip(),
             "shared_with_registration": False,
         }
     clash_base = str(settings.clash_controller_url or "").strip()
@@ -77,11 +80,18 @@ def resolve_rotation_target() -> dict:
         return {}
     if not _egress_alive(clash_proxy):
         return {}
+    # 本调度器只服务 Codex OAuth 在途轮换（见 _tick 门控），即使落到共用实例也必须按
+    # OAuth 的地区/白名单轮换，否则会把 OAuth 出口从美国切回注册的日本。
     return {
         "controller_url": clash_base,
         "selector_name": str(settings.clash_selector_name or "").strip(),
         "proxy": clash_proxy,
-        "region_keywords": str(settings.clash_allowed_region_keywords or "").strip(),
+        "region_keywords": str(
+            settings.oauth_clash_allowed_region_keywords or settings.clash_allowed_region_keywords or ""
+        ).strip(),
+        "node_keywords": str(
+            settings.oauth_clash_allowed_node_keywords or settings.clash_allowed_node_keywords or ""
+        ).strip(),
         "shared_with_registration": True,
     }
 
@@ -200,6 +210,7 @@ class ProxyRotationScheduler:
                         selector_name=target["selector_name"],
                         proxy=target["proxy"],
                         region_keywords=target["region_keywords"],
+                        node_keywords=target["node_keywords"] or None,
                         log=lambda message: emit_log(message, flush=True),
                     ),
                     timeout=budget,

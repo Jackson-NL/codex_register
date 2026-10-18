@@ -210,7 +210,7 @@ export default function CodexOAuth() {
   const logPanelRef = useRef(null);
   const logStickRef = useRef(true);
   const [logFollowing, setLogFollowing] = useState(true);
-  const { running, activeAction, currentTarget, currentStage, currentFlow, runStatus, results, logs, backendJobId, targetCount, concurrency, activeAccountIds } = runtime;
+  const { running, activeAction, currentTarget, currentStage, currentFlow, runStatus, results, logs, backendJobId, targetCount, concurrency, activeAccountIds, rebuildRound, rebuildPending } = runtime;
   const renderedLogs = useMemo(() => visibleOAuthLogs(logs), [logs]);
   const hiddenLogCount = Math.max(0, logs.length - renderedLogs.length);
   const logScrollSignal = useMemo(() => oauthLogScrollSignal(logs), [logs]);
@@ -337,14 +337,35 @@ export default function CodexOAuth() {
   }, [appendLog, applyJobSnapshot]);
 
   useEffect(() => {
-    if (!backendJobId || !running) return undefined;
+    if (!backendJobId) return undefined;
     let stopped = false;
     let timer = null;
     const tick = async () => {
       try {
         const job = await api.accounts.oauthJob(backendJobId);
-        if (!stopped) applyJobSnapshot(job);
-        if (!job?.running && mountedRef.current) loadAccounts();
+        if (stopped) return;
+        applyJobSnapshot(job);
+        if (job?.running) {
+          timer = window.setTimeout(tick, 1200);
+          return;
+        }
+        // 本轮已结束：若失败账号自动补跑，后端已重建下一轮 job（新 job_id）。
+        // 有活跃 job 则接管跟随（可能是补跑下一轮，也可能是用户手动新任务）；
+        // 否则若旧 job 仍标记 rebuild_pending（冷却等待中），继续轮询直至下一轮出现。
+        const active = await api.accounts.oauthJobActive();
+        if (stopped) return;
+        if (active) {
+          applyJobSnapshot(active);
+          timer = window.setTimeout(tick, 1200);
+          return;
+        }
+        const refresh = await api.accounts.oauthJob(backendJobId);
+        if (stopped) return;
+        if (refresh?.rebuild_pending) {
+          timer = window.setTimeout(tick, 2000);
+          return;
+        }
+        if (mountedRef.current) loadAccounts();
       } catch (error) {
         if (isOAuthJobMissingError(error)) {
           codexOAuthRuntime.patch(staleOAuthJobPatch());
@@ -352,8 +373,7 @@ export default function CodexOAuth() {
           return;
         }
         appendLog(`后台 OAuth 任务状态轮询失败：${formatOAuthErrorMessage(error)}`, "warning");
-      } finally {
-        if (!stopped && codexOAuthRuntime.getSnapshot().running) timer = window.setTimeout(tick, 1200);
+        if (!stopped) timer = window.setTimeout(tick, 3000);
       }
     };
     tick();
@@ -601,6 +621,7 @@ export default function CodexOAuth() {
               <div className="flex flex-wrap items-center gap-2">
                 <span className="text-sm font-semibold text-slate-800">Codex 授权 OAuth</span>
                 <Badge color={runStatusMeta.color} dot>{runStatusMeta.label}</Badge>
+                {rebuildRound > 1 && <Badge color="info" dot>补跑第 {rebuildRound} 轮</Badge>}
                 <Badge color="neutral">{targetLabel}</Badge>
               </div>
               <div className="mt-1 flex flex-wrap gap-1.5 text-[11px] text-slate-500">
@@ -671,6 +692,7 @@ export default function CodexOAuth() {
                 <div className="flex flex-wrap gap-3">
                   <Switch checked={form.headless} onChange={(value) => setField("headless", value)} disabled={running} label="无头模式" />
                   <Switch checked={form.low_price_first} onChange={(value) => setField("low_price_first", value)} disabled={running} label="接码低价优先" />
+                  <Switch checked={form.auto_rebuild_failed !== false} onChange={(value) => setField("auto_rebuild_failed", value)} disabled={running} label="失败自动补跑下一轮(跑完为止)" />
                 </div>
                 <div className="flex gap-2">
                   <Button variant="secondary" size="sm" icon={<Save size={13} />} onClick={saveOAuthParams} disabled={running}>保存</Button>

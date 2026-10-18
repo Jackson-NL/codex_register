@@ -16,3 +16,6 @@ def _isolate_rotation_settings(monkeypatch):
     monkeypatch.setattr(clash_verge.settings, "clash_rotation_order", "round_robin")
     # 同理：生产 .env 会带上要同步切换的兜底组，会让"只切主组"的用例多出一次 PUT。
     monkeypatch.setattr(clash_verge.settings, "clash_rotate_extra_groups", "")
+    # 生产 .env 会把轮换锁到日本高速01-05 白名单；用例使用通用节点名（node-a 等），
+    # 必须重置为空，否则全部候选被白名单过滤。验证白名单的用例在各自内部显式设置。
+    monkeypatch.setattr(clash_verge.settings, "clash_allowed_node_keywords", "")

@@ -482,3 +482,335 @@ class AccountOAuthRefreshTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(CodexOAuthJobBody(account_ids=[1]).allow_phone_fallback)
         self.assertFalse(CodexOAuthJobBody(account_ids=[1], allow_phone_fallback=False).allow_phone_fallback)
+
+
+class CodexOAuthRebuildTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from app.api import accounts as accounts_api
+
+        self._saved_active = accounts_api._ACTIVE_OAUTH_JOB_ID
+        accounts_api._ACTIVE_OAUTH_JOB_ID = None
+        self._saved_jobs = dict(accounts_api._OAUTH_JOBS)
+        accounts_api._OAUTH_JOBS.clear()
+
+    async def asyncTearDown(self):
+        from app.api import accounts as accounts_api
+
+        accounts_api._OAUTH_JOBS.clear()
+        accounts_api._OAUTH_JOBS.update(self._saved_jobs)
+        accounts_api._ACTIVE_OAUTH_JOB_ID = self._saved_active
+
+    def _job(self, job_id="rebuild-root-1", results=None, status="failed"):
+        return {
+            "job_id": job_id,
+            "status": status,
+            "results": results or [],
+        }
+
+    async def test_codex_oauth_job_body_defaults_auto_rebuild(self):
+        from app.api.accounts import CodexOAuthJobBody
+
+        payload = CodexOAuthJobBody(account_ids=[1])
+        self.assertTrue(payload.auto_rebuild_failed)
+        self.assertEqual(payload.rebuild_round, 1)
+        self.assertEqual(payload.rebuild_root_job_id, "")
+
+    async def test_codex_oauth_job_schedules_rebuild_after_failures(self):
+        from app.api import accounts as accounts_api
+
+        job_id = "rebuild-sched"
+        job = {
+            "job_id": job_id,
+            "status": "pending",
+            "account_ids": [1, 2],
+            "results": [],
+            "error": "",
+            "started_at": "",
+            "finished_at": "",
+            "cancel_event": asyncio.Event(),
+        }
+        accounts_api._OAUTH_JOBS[job_id] = job
+        payload = accounts_api.CodexOAuthJobBody(account_ids=[1, 2])
+        try:
+            with (
+                patch.object(accounts_api, "_select_oauth_proxy", new=AsyncMock(return_value="")),
+                patch.object(accounts_api.settings, "clash_rotate_enabled", False),
+                patch.object(accounts_api, "_run_oauth_target_pool", new=AsyncMock(return_value=[(1, False), (2, True)])),
+                patch.object(accounts_api, "_maybe_oauth_rebuild", new=AsyncMock()) as rebuild,
+            ):
+                await accounts_api._run_codex_oauth_job(job_id, payload)
+
+            rebuild.assert_awaited_once()
+            self.assertEqual(job["status"], "failed")
+            self.assertTrue(job["rebuild_pending"])
+        finally:
+            accounts_api._OAUTH_JOBS.clear()
+
+    async def test_codex_oauth_job_skips_rebuild_on_success(self):
+        from app.api import accounts as accounts_api
+
+        job_id = "rebuild-success"
+        job = {
+            "job_id": job_id,
+            "status": "pending",
+            "account_ids": [1],
+            "results": [],
+            "error": "",
+            "started_at": "",
+            "finished_at": "",
+            "cancel_event": asyncio.Event(),
+        }
+        accounts_api._OAUTH_JOBS[job_id] = job
+        payload = accounts_api.CodexOAuthJobBody(account_ids=[1])
+        try:
+            with (
+                patch.object(accounts_api, "_select_oauth_proxy", new=AsyncMock(return_value="")),
+                patch.object(accounts_api.settings, "clash_rotate_enabled", False),
+                patch.object(accounts_api, "_run_oauth_target_pool", new=AsyncMock(return_value=[(1, True)])),
+                patch.object(accounts_api, "_maybe_oauth_rebuild", new=AsyncMock()),
+            ):
+                await accounts_api._run_codex_oauth_job(job_id, payload)
+
+            self.assertEqual(job["status"], "success")
+            self.assertFalse(job["rebuild_pending"])
+        finally:
+            accounts_api._OAUTH_JOBS.clear()
+
+    async def test_codex_oauth_job_skips_rebuild_when_disabled(self):
+        from app.api import accounts as accounts_api
+
+        job_id = "rebuild-disabled"
+        job = {
+            "job_id": job_id,
+            "status": "pending",
+            "account_ids": [1],
+            "results": [],
+            "error": "",
+            "started_at": "",
+            "finished_at": "",
+            "cancel_event": asyncio.Event(),
+        }
+        accounts_api._OAUTH_JOBS[job_id] = job
+        payload = accounts_api.CodexOAuthJobBody(account_ids=[1], auto_rebuild_failed=False)
+        try:
+            with (
+                patch.object(accounts_api, "_select_oauth_proxy", new=AsyncMock(return_value="")),
+                patch.object(accounts_api.settings, "clash_rotate_enabled", False),
+                patch.object(accounts_api, "_run_oauth_target_pool", new=AsyncMock(return_value=[(1, False)])),
+                patch.object(accounts_api, "_maybe_oauth_rebuild", new=AsyncMock()),
+            ):
+                await accounts_api._run_codex_oauth_job(job_id, payload)
+
+            self.assertEqual(job["status"], "failed")
+            self.assertFalse(job["rebuild_pending"])
+        finally:
+            accounts_api._OAUTH_JOBS.clear()
+
+    async def test_codex_oauth_job_skips_rebuild_when_stopped(self):
+        from app.api import accounts as accounts_api
+
+        job_id = "rebuild-stopped"
+        job = {
+            "job_id": job_id,
+            "status": "pending",
+            "account_ids": [1],
+            "results": [],
+            "error": "",
+            "started_at": "",
+            "finished_at": "",
+            "cancel_event": asyncio.Event(),
+        }
+        job["cancel_event"].set()
+        accounts_api._OAUTH_JOBS[job_id] = job
+        payload = accounts_api.CodexOAuthJobBody(account_ids=[1])
+        try:
+            with (
+                patch.object(accounts_api, "_select_oauth_proxy", new=AsyncMock(return_value="")),
+                patch.object(accounts_api.settings, "clash_rotate_enabled", False),
+                patch.object(accounts_api, "_run_oauth_target_pool", new=AsyncMock(return_value=[(1, False)])),
+                patch.object(accounts_api, "_maybe_oauth_rebuild", new=AsyncMock()),
+            ):
+                await accounts_api._run_codex_oauth_job(job_id, payload)
+
+            self.assertEqual(job["status"], "stopped")
+            self.assertFalse(job["rebuild_pending"])
+        finally:
+            accounts_api._OAUTH_JOBS.clear()
+
+    async def test_is_oauth_banned_account_error_classifies(self):
+        from app.api.accounts import _is_oauth_banned_account_error
+
+        for banned in (
+            "token revoked",
+            "invalidated oauth token",
+            "账号已停用",
+            "账号不存在",
+            "this account is deactivated",
+            "your account is banned",
+            "account disabled",
+            "封禁",
+        ):
+            self.assertTrue(_is_oauth_banned_account_error(banned), banned)
+        for allowed in ("timeout", "429", "rate limit", "手机验证", "oauth callback timeout"):
+            self.assertFalse(_is_oauth_banned_account_error(allowed), allowed)
+
+    async def test_schedule_oauth_rebuild_chains_failed_non_banned_ids(self):
+        from app.api import accounts as accounts_api
+
+        class DummyAccount:
+            def __init__(self, account_id):
+                self.id = account_id
+
+        class FakeSession:
+            def get(self, model, account_id):
+                return DummyAccount(account_id)
+
+            def close(self):
+                pass
+
+        job = self._job(
+            "rebuild-root-1",
+            [
+                {"id": 1, "status": "failed", "error": "token revoked"},
+                {"id": 2, "status": "failed", "error": "oauth callback timeout"},
+                {"id": 3, "status": "success", "error": ""},
+            ],
+        )
+        payload = accounts_api.CodexOAuthJobBody(account_ids=[1, 2, 3], headless=True, concurrency=2)
+        mock_run = AsyncMock()
+        try:
+            with (
+                patch.object(accounts_api, "SessionLocal", return_value=FakeSession()),
+                patch.object(accounts_api, "oauth_block_reason", return_value=""),
+                patch.object(accounts_api.settings, "oauth_rebuild_cooldown_seconds", 0.0),
+                patch.object(accounts_api, "_run_codex_oauth_job", mock_run),
+            ):
+                await accounts_api._maybe_oauth_rebuild(job, payload)
+            await asyncio.sleep(0.01)
+
+            self.assertTrue(job["rebuild_pending"])
+            self.assertEqual(job["results"][0].get("rebuild_excluded"), "banned")
+            self.assertNotIn("rebuild_excluded", job["results"][1])
+            self.assertIsNotNone(accounts_api._ACTIVE_OAUTH_JOB_ID)
+            next_job = accounts_api._OAUTH_JOBS[accounts_api._ACTIVE_OAUTH_JOB_ID]
+            self.assertEqual(next_job["account_ids"], [2])
+            self.assertEqual(next_job["rebuild_round"], 2)
+            self.assertEqual(next_job["rebuild_root_job_id"], "rebuild-root-1")
+            mock_run.assert_awaited_once()
+            sent_payload = mock_run.await_args.args[1]
+            self.assertEqual(sent_payload.account_ids, [2])
+            self.assertEqual(sent_payload.rebuild_round, 2)
+            self.assertEqual(sent_payload.rebuild_root_job_id, "rebuild-root-1")
+            self.assertEqual(sent_payload.concurrency, 2)
+            self.assertTrue(sent_payload.headless)
+        finally:
+            accounts_api._OAUTH_JOBS.clear()
+            accounts_api._ACTIVE_OAUTH_JOB_ID = None
+
+    async def test_schedule_oauth_rebuild_finalizes_when_all_banned(self):
+        from app.api import accounts as accounts_api
+
+        job = self._job(
+            "rebuild-banned",
+            [
+                {"id": 1, "status": "failed", "error": "token revoked"},
+                {"id": 2, "status": "failed", "error": "账号已停用"},
+            ],
+        )
+        payload = accounts_api.CodexOAuthJobBody(account_ids=[1, 2])
+        mock_run = AsyncMock()
+        try:
+            with (
+                patch.object(accounts_api, "SessionLocal", return_value=type("S", (), {"get": lambda self, m, i: (_ for _ in ()).throw(AssertionError("banned accounts should not hit db")), "close": lambda self: None})()),
+                patch.object(accounts_api.settings, "oauth_rebuild_cooldown_seconds", 0.0),
+                patch.object(accounts_api, "_run_codex_oauth_job", mock_run),
+            ):
+                await accounts_api._maybe_oauth_rebuild(job, payload)
+            await asyncio.sleep(0.01)
+
+            self.assertFalse(job["rebuild_pending"])
+            self.assertIsNone(accounts_api._ACTIVE_OAUTH_JOB_ID)
+            mock_run.assert_not_awaited()
+        finally:
+            accounts_api._OAUTH_JOBS.clear()
+            accounts_api._ACTIVE_OAUTH_JOB_ID = None
+
+    async def test_schedule_oauth_rebuild_finalizes_when_all_ineligible(self):
+        from app.api import accounts as accounts_api
+
+        job = self._job(
+            "rebuild-ineligible",
+            [{"id": 7, "status": "failed", "error": "oauth callback timeout"}],
+        )
+        payload = accounts_api.CodexOAuthJobBody(account_ids=[7])
+        mock_run = AsyncMock()
+        try:
+            with (
+                patch.object(accounts_api, "SessionLocal", return_value=type("S", (), {"get": lambda self, m, i: object(), "close": lambda self: None})()),
+                patch.object(accounts_api, "oauth_block_reason", return_value="需要手机验证"),
+                patch.object(accounts_api.settings, "oauth_rebuild_cooldown_seconds", 0.0),
+                patch.object(accounts_api, "_run_codex_oauth_job", mock_run),
+            ):
+                await accounts_api._maybe_oauth_rebuild(job, payload)
+            await asyncio.sleep(0.01)
+
+            self.assertFalse(job["rebuild_pending"])
+            self.assertEqual(job["results"][0].get("rebuild_excluded"), "需要手机验证")
+            self.assertIsNone(accounts_api._ACTIVE_OAUTH_JOB_ID)
+            mock_run.assert_not_awaited()
+        finally:
+            accounts_api._OAUTH_JOBS.clear()
+            accounts_api._ACTIVE_OAUTH_JOB_ID = None
+
+    async def test_schedule_oauth_rebuild_aborts_when_active_job_exists(self):
+        from app.api import accounts as accounts_api
+
+        job = self._job(
+            "rebuild-abort",
+            [{"id": 9, "status": "failed", "error": "timeout"}],
+        )
+        payload = accounts_api.CodexOAuthJobBody(account_ids=[9])
+        mock_run = AsyncMock()
+        accounts_api._ACTIVE_OAUTH_JOB_ID = "user-job-xyz"
+        try:
+            with (
+                patch.object(accounts_api, "SessionLocal", return_value=type("S", (), {"get": lambda self, m, i: object(), "close": lambda self: None})()),
+                patch.object(accounts_api, "oauth_block_reason", return_value=""),
+                patch.object(accounts_api.settings, "oauth_rebuild_cooldown_seconds", 0.0),
+                patch.object(accounts_api, "_run_codex_oauth_job", mock_run),
+            ):
+                await accounts_api._maybe_oauth_rebuild(job, payload)
+            await asyncio.sleep(0.01)
+
+            self.assertFalse(job["rebuild_pending"])
+            self.assertEqual(accounts_api._ACTIVE_OAUTH_JOB_ID, "user-job-xyz")
+            mock_run.assert_not_awaited()
+        finally:
+            accounts_api._OAUTH_JOBS.clear()
+            accounts_api._ACTIVE_OAUTH_JOB_ID = None
+
+    async def test_oauth_job_snapshot_includes_rebuild_fields(self):
+        from app.api import accounts as accounts_api
+
+        job = {
+            "job_id": "snap-r",
+            "status": "failed",
+            "account_ids": [1],
+            "current_account_id": None,
+            "current_flow": "direct",
+            "current_stage": -1,
+            "concurrency": 3,
+            "active_accounts": {},
+            "results": [],
+            "error": "",
+            "started_at": "",
+            "finished_at": "",
+            "rebuild_round": 2,
+            "rebuild_root_job_id": "rebuild-root-1",
+            "rebuild_pending": True,
+        }
+        snapshot = accounts_api._oauth_job_snapshot(job)
+
+        self.assertEqual(snapshot["rebuild_round"], 2)
+        self.assertEqual(snapshot["rebuild_root_job_id"], "rebuild-root-1")
+        self.assertTrue(snapshot["rebuild_pending"])

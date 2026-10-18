@@ -123,7 +123,6 @@ def _node_name_allowed(name: str, keywords: list[str]) -> bool:
     lowered = str(name).lower()
     return any(k in lowered for k in keywords)
 
-
 def _region_keywords() -> list[str]:
     return _parse_region_keywords(None)
 
@@ -153,10 +152,12 @@ def _real_candidates(
     selector_name: str,
     region_keywords: list[str] | None = None,
     skip_unhealthy: bool = True,
+    ignore_node_keywords: bool = False,
+    node_keywords: list[str] | None = None,
 ) -> list[str]:
     if region_keywords is None:
         region_keywords = _region_keywords()
-    node_keywords = _node_keywords()
+    node_keywords = [] if ignore_node_keywords else (node_keywords if node_keywords is not None else _node_keywords())
     selector = proxies.get(selector_name) or {}
     all_names = list(selector.get("all") or [])
     return [
@@ -220,12 +221,17 @@ def ordered_real_proxy_candidates(
     selector_name: str,
     region_keywords: list[str] | None = None,
     skip_unhealthy: bool = True,
+    ignore_node_keywords: bool = False,
+    node_keywords: list[str] | None = None,
 ) -> list[str]:
     """返回从当前节点后一个开始的真实落地节点序列，最后回绕到当前节点。"""
     selector = proxies.get(selector_name) or {}
     now = str(selector.get("now") or "")
     keywords = _region_keywords() if region_keywords is None else region_keywords
-    candidates = _real_candidates(proxies, selector_name, keywords, skip_unhealthy=skip_unhealthy)
+    candidates = _real_candidates(
+        proxies, selector_name, keywords, skip_unhealthy=skip_unhealthy,
+        ignore_node_keywords=ignore_node_keywords, node_keywords=node_keywords,
+    )
     if not candidates:
         raise ValueError(
             f"Selector {selector_name} 没有可切换的真实节点："
@@ -238,9 +244,15 @@ def ordered_real_proxy_candidates(
 
 
 def _unfiltered_candidates(proxies: dict[str, Any], selector_name: str) -> list[str]:
-    """忽略地区过滤的候选池，用于区分"关键词写错了"和"真的没有可用节点"。"""
+    """忽略地区与节点白名单的候选池，用于区分「关键词写错了」和「真的没有可用节点」。
+
+    订阅换名后地区/白名单可能 0 命中：宁可降级用任意真实节点（并告警），
+    也不要把轮换卡死、让注册钉在同一 IP 上。
+    """
     try:
-        return ordered_real_proxy_candidates(proxies, selector_name, [], skip_unhealthy=False)
+        return ordered_real_proxy_candidates(
+            proxies, selector_name, [], skip_unhealthy=False, ignore_node_keywords=True
+        )
     except ValueError:
         return []
 
@@ -584,7 +596,7 @@ def _resolve_effective_selector(
     return detected
 
 
-def rotate_clash_proxy_sync(log=None, controller_url: str = "", selector_name: str = "", proxy: str = "", region_keywords: str | list[str] | None = None) -> dict:
+def rotate_clash_proxy_sync(log=None, controller_url: str = "", selector_name: str = "", proxy: str = "", region_keywords: str | list[str] | None = None, node_keywords: str | list[str] | None = None) -> dict:
     """同步执行一次节点切换；只有代理连通且出口 IP 已变化才视为成功。
 
     log: 可选回调，每一步写入 batch 日志（前端轮询可见）；用于诊断 Clash 控制器
@@ -651,6 +663,10 @@ def rotate_clash_proxy_sync(log=None, controller_url: str = "", selector_name: s
     if region_keywords:
         _emit("·", f"地区限制关键词: {','.join(region_keywords)}")
 
+    allow_node_keywords = _parse_node_keywords(node_keywords) if node_keywords is not None else _node_keywords()
+    if allow_node_keywords:
+        _emit("·", f"节点白名单生效: {','.join(allow_node_keywords)}")
+
     max_delay = _max_delay_ms()
     if max_delay:
         _emit("·", f"延迟上限: {max_delay}ms")
@@ -663,12 +679,16 @@ def rotate_clash_proxy_sync(log=None, controller_url: str = "", selector_name: s
             selector_name,
             region_keywords,
             skip_unhealthy=False,
+            node_keywords=allow_node_keywords or None,
         )
     except ValueError as exc:
         # 订阅换名（例如 良心云 的 "|BGP|CUCM" 换成 suxins 的 "· Hysteria2"）会让
-        # 地区关键词静默 0 命中，轮换从此长期失效而日志只有"没有可切换的真实节点"。
+        # 地区关键词/节点白名单静默 0 命中，轮换从此长期失效而日志只有"没有可切换的真实节点"。
         # 池子里明明有真实节点时降级为不过滤，宁可换到别的地区也不要钉死在一个 IP 上。
-        fallback = _unfiltered_candidates(proxies, selector_name) if region_keywords else []
+        node_keywords = _parse_node_keywords(node_keywords) if node_keywords is not None else _node_keywords()
+        fallback = (
+            _unfiltered_candidates(proxies, selector_name) if (region_keywords or node_keywords) else []
+        )
         if not fallback:
             _emit("✗", str(exc))
             return {
@@ -686,8 +706,9 @@ def rotate_clash_proxy_sync(log=None, controller_url: str = "", selector_name: s
             }
         _emit(
             "⚠",
-            f"地区关键词 [{','.join(region_keywords)}] 在当前订阅 0 命中（订阅可能已换名），"
-            f"降级为不限制地区，从 {len(fallback)} 个真实节点中轮换",
+            f"地区关键词 [{','.join(region_keywords)}]{'/' if node_keywords else ''}"
+            f"{','.join(node_keywords)} 在当前订阅 0 命中（订阅可能已换名），"
+            f"降级为不限制地区与节点白名单，从 {len(fallback)} 个真实节点中轮换",
         )
         ordered = fallback
 
@@ -812,17 +833,19 @@ def rotate_clash_proxy_sync(log=None, controller_url: str = "", selector_name: s
     }
 
 
-async def rotate_clash_proxy_for_round(log=None, controller_url: str = "", selector_name: str = "", proxy: str = "", region_keywords: str | list[str] | None = None) -> dict:
+async def rotate_clash_proxy_for_round(log=None, controller_url: str = "", selector_name: str = "", proxy: str = "", region_keywords: str | list[str] | None = None, node_keywords: str | list[str] | None = None) -> dict:
     """异步包装：每开新轮次前调用。失败返回 ok=False，不直接打断流程。
 
     controller_url/selector_name/proxy: 指定要操作的 Mihomo 实例（默认 settings.clash_*）。
     region_keywords: 本次轮换的地区过滤；None=用全局，OAuth 请传 oauth 独立关键词。
+    node_keywords: 本次轮换的节点白名单；None=用全局（含 OAuth 场景跟随注册白名单），
+      OAuth 如需独立美国节点请传 settings.oauth_clash_allowed_node_keywords。
     """
     loop = asyncio.get_running_loop()
     try:
         return await loop.run_in_executor(
             None,
-            lambda: rotate_clash_proxy_sync(log=log, controller_url=controller_url, selector_name=selector_name, proxy=proxy, region_keywords=region_keywords),
+            lambda: rotate_clash_proxy_sync(log=log, controller_url=controller_url, selector_name=selector_name, proxy=proxy, region_keywords=region_keywords, node_keywords=node_keywords),
         )
     except Exception as exc:  # noqa: BLE001
         try:

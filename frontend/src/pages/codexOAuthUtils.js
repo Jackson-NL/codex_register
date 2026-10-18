@@ -68,6 +68,7 @@ export const DEFAULT_OAUTH_PARAMS = Object.freeze({
   sms_poll_timeout: 60,
   sms_poll_interval: 4,
   concurrency: 3,
+  auto_rebuild_failed: true,
 });
 
 export function codexOAuthConsoleLayout() {
@@ -320,6 +321,9 @@ const DEFAULT_OAUTH_RUNTIME = Object.freeze({
   backendLogSeq: 0,
   concurrency: DEFAULT_OAUTH_PARAMS.concurrency,
   activeAccountIds: [],
+  rebuildRound: 1,
+  rebuildRootJobId: "",
+  rebuildPending: false,
 });
 
 function loadOAuthRuntime(storage) {
@@ -463,6 +467,9 @@ export function projectOAuthJob(job = {}) {
     currentStage: Number.isFinite(Number(job?.current_stage)) ? Number(job.current_stage) : -1,
     concurrency: Number.isFinite(Number(job?.concurrency)) ? Number(job.concurrency) : DEFAULT_OAUTH_PARAMS.concurrency,
     activeAccountIds: Array.isArray(job?.active_account_ids) ? job.active_account_ids.map(Number).filter(Number.isInteger) : [],
+    rebuildRound: Number.isFinite(Number(job?.rebuild_round)) && Number(job.rebuild_round) > 0 ? Number(job.rebuild_round) : 1,
+    rebuildRootJobId: String(job?.rebuild_root_job_id || ""),
+    rebuildPending: Boolean(job?.rebuild_pending),
   };
   if (Array.isArray(job?.results)) {
     projected.results = job.results.map((item) => ({ ...projectOAuthResult(item), status: item.status || "success", error: item.error || "" }));
@@ -527,6 +534,7 @@ export function buildOAuthPayload(values = {}) {
     sms_poll_timeout: numberOrDefault(values.sms_poll_timeout, DEFAULT_OAUTH_PARAMS.sms_poll_timeout),
     sms_poll_interval: numberOrDefault(values.sms_poll_interval, DEFAULT_OAUTH_PARAMS.sms_poll_interval),
     concurrency: integerInRange(values.concurrency, DEFAULT_OAUTH_PARAMS.concurrency, 1, 10),
+    auto_rebuild_failed: Boolean(values.auto_rebuild_failed ?? DEFAULT_OAUTH_PARAMS.auto_rebuild_failed),
   };
 }
 
@@ -541,6 +549,7 @@ export function createOAuthFormValues(values = {}) {
     sms_poll_timeout: String(payload.sms_poll_timeout),
     sms_poll_interval: String(payload.sms_poll_interval),
     concurrency: String(payload.concurrency),
+    auto_rebuild_failed: payload.auto_rebuild_failed,
   };
 }
 

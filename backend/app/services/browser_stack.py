@@ -166,12 +166,22 @@ def build_launch_options(
 
 
 # 运行时真实指纹探针：页面内读取实际生效值，用于日志核验（计划值 ≠ 实际值）
+# 覆盖两组信号：
+# 1) 计划值核对：timezone/viewport/dpr/screen/language（启动参数是否真生效）
+# 2) 自洽性核对：outer(浏览器 chrome 高度)/platform/colorDepth（headless 完整性与
+#    os 声明是否矛盾——Camoufox 升级或配置漂移导致穿帮时，日志当天可见）
 FINGERPRINT_PROBE_JS = """
 () => ({
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     viewport: `${window.innerWidth}x${window.innerHeight}`,
+    outer: `${window.outerWidth}x${window.outerHeight}`,
+    screenX: window.screenX,
+    screenY: window.screenY,
     dpr: window.devicePixelRatio,
     screen: `${screen.width}x${screen.height}`,
+    platform: navigator.platform,
+    hardwareConcurrency: navigator.hardwareConcurrency,
+    colorDepth: screen.colorDepth,
     language: navigator.language,
     languages: Array.from(navigator.languages || []),
 })
@@ -195,6 +205,49 @@ async def probe_runtime_fingerprint(page) -> dict:
 VIEWPORTS = [
     (1366, 768), (1440, 900), (1536, 864), (1920, 1080), (1280, 800), (1600, 900), (1680, 1050),
 ]
+# 视口池按真实桌面市场份额加权（statcounter 桌面分辨率分布的近似）。
+# 为什么必须加权：均匀随机会产生「每个分辨率占比 ~14%」的边缘分布，而真实人口
+# 1920x1080 一款占 ~23%、前三款覆盖 ~50%——均匀分布在人类群体中统计不可能出现，
+# 反欺诈侧单看边际分布即可判定非人类。加权后与真实网民群体混同，聚类信号消失。
+VIEWPORT_POOL: list[tuple[tuple[int, int], float]] = [
+    ((1920, 1080), 22.0),
+    ((1366, 768), 13.5),
+    ((1536, 864), 10.0),
+    ((1440, 900), 6.5),
+    ((1600, 900), 4.5),
+    ((1280, 720), 4.0),
+    ((1360, 768), 3.0),
+    ((2560, 1440), 3.0),
+    ((1920, 1200), 2.5),
+    ((1280, 800), 2.0),
+    ((1680, 1050), 1.8),
+    ((1440, 960), 1.6),
+    ((2560, 1600), 1.5),
+    ((2048, 1152), 1.4),
+    ((3840, 2160), 1.2),
+    ((1280, 1024), 1.0),
+    ((1600, 1200), 0.8),
+    ((1152, 864), 0.6),
+    ((1280, 960), 0.5),
+    ((1024, 768), 0.4),
+]
+VIEWPORTS = [vp for vp, _w in VIEWPORT_POOL]
+_VIEWPORT_WEIGHTS = [w for _vp, w in VIEWPORT_POOL]
+# macOS 侧视口子池：剔除 4K(3840x2160)——Retina Mac 配 8K 显示器真实占比
+# ~0.01%，抽中即产生稀有组合；4K 留给 Windows（dpr=1 的 4K 屏是常见形态）。
+_MACOS_EXCLUDE = {(3840, 2160)}
+VIEWPORTS_MACOS = [vp for vp in VIEWPORTS if vp not in _MACOS_EXCLUDE]
+_VIEWPORT_WEIGHTS_MACOS = [w for vp, w in VIEWPORT_POOL if vp not in _MACOS_EXCLUDE]
+# os 按桌面端市场份额加权（Windows ~72% / macOS ~16% / 其它，池内两选项归一）
+OS_POOL: list[tuple[str, float]] = [("windows", 78.0), ("macos", 22.0)]
+OS_NAMES = [name for name, _w in OS_POOL]
+_OS_WEIGHTS = [w for _name, w in OS_POOL]
+# dsf 按 os 条件加权：macOS 绝大多数 Retina(2.0)；Windows 以 100% 缩放(1.0)为主，
+# 125%/150% 为常见显示缩放。集合与历史一致，只把概率改成真实形态。
+_DSF_BY_OS: dict[str, tuple[list[float], list[float]]] = {
+    "macos": ([1.0, 2.0], [10.0, 90.0]),
+    "windows": ([1.0, 1.25, 1.5], [72.0, 15.0, 13.0]),
+}
 # 地区 → 匹配的时区池（与出口 IP 地理一致）
 TIMEZONE_BY_REGION = {
     "JP": ["Asia/Tokyo"],
@@ -261,20 +314,27 @@ def locale_pool_for_region(region: str = "") -> list[str]:
 def random_environment(region: str = "") -> dict:
     """生成一组与环境（出口 IP 地区）一致的指纹参数。
 
-    - 视口/DPI：合理随机（真实用户多样）
+    - 视口/DPI：按真实桌面市场份额加权随机（不是均匀随机——均匀分布本身
+      就是可被聚类分析判定的非人类特征）
     - 时区：优先从 region 对应时区池选（与出口 IP 一致）；region 未知时回退随机池
     - locale：按 region 取子集（盎格鲁地区用本地变体，其余中性英文）
     - os 与 device_scale_factor 联动：2.0 基本等于 Retina/高分物理屏（macOS 常见），
       非整数缩放 1.25/1.5 属于 Windows 显示缩放；独立随机造出 macOS+1.25 这类罕见组合。
       os 在这里一次性决定，build_launch_options 不再另起一次随机，避免两处不一致。
     """
-    w, h = random.choice(VIEWPORTS)
+    os_name = random.choices(OS_NAMES, weights=_OS_WEIGHTS, k=1)[0]
+    # 视口按 os 分流加权：macOS 剔除 4K（Retina Mac 配 8K 显示器稀有），
+    # Windows 用全池（4K@dpr1 是常见形态）。
+    if os_name == "macos":
+        w, h = random.choices(VIEWPORTS_MACOS, weights=_VIEWPORT_WEIGHTS_MACOS, k=1)[0]
+    else:
+        w, h = random.choices(VIEWPORTS, weights=_VIEWPORT_WEIGHTS, k=1)[0]
     tz_pool = TIMEZONE_BY_REGION.get(region) if region else None
     if not tz_pool:
         # 回退：全部时区池拍平随机
         tz_pool = [tz for pool in TIMEZONE_BY_REGION.values() for tz in pool]
-    os_name = random.choice(["windows", "macos"])
-    dsf = random.choice([1.0, 2.0, 2.0]) if os_name == "macos" else random.choice([1.0, 1.0, 1.25, 1.5])
+    dsf_choices, dsf_weights = _DSF_BY_OS[os_name]
+    dsf = random.choices(dsf_choices, weights=dsf_weights, k=1)[0]
     return {
         "viewport": {"width": w, "height": h},
         "timezone_id": random.choice(tz_pool),
@@ -315,6 +375,73 @@ async def human_pause(page=None, min_s: float = 3.0, max_s: float = 12.0) -> Non
     await asyncio.sleep(random.uniform(min_s, max_s))
 
 
+def plan_mouse_path(
+    sx: float,
+    sy: float,
+    tx: float,
+    ty: float,
+    rng=random,
+    bounds: tuple[float, float] | None = None,
+    profile: str | None = None,
+) -> list[tuple[float, float, float]]:
+    """规划一条拟人鼠标轨迹，返回 [(x, y, delay_ms), ...]（纯函数，可单测）。
+
+    剖面族（profile 显式指定时跳过抽取，供测试钉死）：
+    - standard（50%）：幂函数缓动 ease∈[1.2,1.8]，单调冲向目标
+    - overshoot（30%）：冲过目标 5-15% 后慢速修正回位——真人瞄准的
+      「弹道+修正」两阶段特征，最强的人类行为签名
+    - variable（20%）：步数偏多、中段插一次 30-80ms 握持停顿
+
+    基础运动学：步数随距离缩放（dist/150 夹到 3-12），每步延时随距离
+    放大，总时长从几十到几百 ms 贴近真实瞄准。bounds 给定时坐标夹到
+    视口内（真人也不会把鼠标移出屏幕）。
+    """
+    dist = max(((tx - sx) ** 2 + (ty - sy) ** 2) ** 0.5, 1.0)
+
+    def clamp(x: float, y: float) -> tuple[float, float]:
+        if bounds:
+            x = min(max(x, 0.0), float(bounds[0]))
+            y = min(max(y, 0.0), float(bounds[1]))
+        # ±2px 手震颤：幅度小到不干扰剖面判定，但消除“数学完美轨迹”
+        return x + rng.uniform(-2, 2), y + rng.uniform(-2, 2)
+
+    if profile is None:
+        profile = rng.choices(["standard", "overshoot", "variable"], weights=[50, 30, 20], k=1)[0]
+
+    if profile == "overshoot":
+        over = rng.uniform(0.05, 0.15)
+        steps = max(4, min(12, int(dist / 120) + rng.randint(1, 3)))
+        ballistic_steps = max(2, int(steps * 0.6))
+        path: list[tuple[float, float, float]] = []
+        for i in range(1, ballistic_steps + 1):
+            t = i / ballistic_steps
+            x, y = clamp(sx + (tx - sx) * (1 + over) * t, sy + (ty - sy) * (1 + over) * t)
+            path.append((x, y, rng.uniform(4, 14)))
+        corrective_steps = max(2, steps - ballistic_steps)
+        for i in range(1, corrective_steps + 1):
+            eased = (i / corrective_steps) ** rng.uniform(1.6, 2.4)
+            frac = (1 + over) + (1 - (1 + over)) * eased
+            x, y = clamp(sx + (tx - sx) * frac, sy + (ty - sy) * frac)
+            path.append((x, y, rng.uniform(12, 30)))
+        return path
+
+    steps = max(3, min(12, int(dist / 150) + rng.randint(0, 2)))
+    if profile == "variable":
+        steps = min(12, steps + rng.randint(1, 4))
+    ease = rng.uniform(1.2, 1.8)
+    pause_step = rng.randint(2, max(2, steps - 1)) if profile == "variable" and steps >= 3 else -1
+    path = []
+    for i in range(1, steps + 1):
+        t = i / steps
+        frac = t**ease
+        x, y = clamp(sx + (tx - sx) * frac, sy + (ty - sy) * frac)
+        delay = rng.uniform(5, 20) * (1 + dist / 2000)
+        if i == pause_step:
+            delay += rng.uniform(30, 80)
+        path.append((x, y, delay))
+    return path
+
+
 async def human_mouse_move(page, locator, jitter: int = 12) -> bool:
     """鼠标轨迹：分段移动到目标元素附近（带随机偏移），模拟真人握持移动"""
     try:
@@ -352,17 +479,19 @@ async def human_mouse_move(page, locator, jitter: int = 12) -> bool:
                 break
             sx, sy = random_start()
 
-        # 缓动曲线指数每次手势抽样一次；旧版每步重抽会产生锯齿状加速度剖面
-        ease = random.uniform(1.2, 1.8)
-        steps = random.randint(3, 6)
-        for i in range(1, steps + 1):
-            t = i / steps
-            x = sx + (tx - sx) * (t**ease)
-            y = sy + (ty - sy) * (t**ease)
-            x += random.randint(-6, 6)
-            y += random.randint(-6, 6)
+        # 轨迹剖面多样化：标准幂曲线 / 过冲修正 / 变速段按概率抽取。
+        # 旧版单一幂曲线族 + 固定 3-6 步——几千次注册共用同一运动形态，
+        # 鼠标动力学是反欺诈采集的标准信号，一致性可直接聚类。
+        try:
+            viewport = page.viewport_size or {}
+        except Exception:  # noqa: BLE001
+            viewport = {}
+        bounds = None
+        if viewport.get("width") and viewport.get("height"):
+            bounds = (int(viewport["width"]), int(viewport["height"]))
+        for x, y, delay_ms in plan_mouse_path(sx, sy, tx, ty, bounds=bounds):
             await page.mouse.move(x, y)
-            await asyncio.sleep(random.uniform(0.005, 0.02))
+            await asyncio.sleep(delay_ms / 1000)
         return True
     except Exception:
         return False

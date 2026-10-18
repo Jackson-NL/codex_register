@@ -3296,3 +3296,115 @@ class OAuthAddPhoneFastFailTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("add-phone", str(ctx.exception))
         self.assertIn("auto-phone-from-profile", str(ctx.exception))
+
+
+class FingerprintMismatchWarningTests(unittest.TestCase):
+    """运行时指纹核验：四类穿帮必须检出，干净指纹零误报。"""
+
+    def _fp(self, **over):
+        base = {
+            "timezone": "Asia/Tokyo",
+            "viewport": "1440x900",
+            "outer": "1440x985",
+            "dpr": 2.0,
+            "screen": "1728x1117",
+            "platform": "MacIntel",
+            "colorDepth": 30,
+        }
+        base.update(over)
+        return base
+
+    def test_clean_fingerprint_has_no_warnings(self):
+        from app.services.registrator import _fingerprint_mismatch_warnings
+
+        warnings = _fingerprint_mismatch_warnings(self._fp(), {"os": "macos"}, ["Asia/Tokyo"])
+        self.assertEqual(warnings, [])
+
+    def test_timezone_mismatch_detected(self):
+        from app.services.registrator import _fingerprint_mismatch_warnings
+
+        warnings = _fingerprint_mismatch_warnings(
+            self._fp(timezone="America/New_York"), {"os": "macos"}, ["Asia/Tokyo"]
+        )
+        self.assertTrue(any("时区" in w for w in warnings))
+
+    def test_platform_os_contradiction_detected(self):
+        from app.services.registrator import _fingerprint_mismatch_warnings
+
+        warnings = _fingerprint_mismatch_warnings(
+            self._fp(platform="Win32"), {"os": "macos"}, ["Asia/Tokyo"]
+        )
+        self.assertTrue(any("platform" in w and "矛盾" in w for w in warnings))
+
+    def test_missing_browser_chrome_detected(self):
+        from app.services.registrator import _fingerprint_mismatch_warnings
+
+        warnings = _fingerprint_mismatch_warnings(
+            self._fp(outer="1440x905"), {"os": "macos"}, ["Asia/Tokyo"]
+        )
+        self.assertTrue(any("chrome" in w for w in warnings))
+
+    def test_color_depth_os_mismatch_detected(self):
+        from app.services.registrator import _fingerprint_mismatch_warnings
+
+        warnings = _fingerprint_mismatch_warnings(
+            self._fp(colorDepth=24), {"os": "macos"}, ["Asia/Tokyo"]
+        )
+        self.assertTrue(any("colorDepth" in w for w in warnings))
+
+    def test_empty_or_partial_fingerprint_never_false_alarms(self):
+        from app.services.registrator import _fingerprint_mismatch_warnings
+
+        self.assertEqual(_fingerprint_mismatch_warnings({}, {"os": "macos"}, []), [])
+        self.assertEqual(
+            _fingerprint_mismatch_warnings({"platform": "MacIntel"}, {"os": "macos"}, []), []
+        )
+        # outer/viewport 格式异常不炸
+        self.assertEqual(
+            _fingerprint_mismatch_warnings(
+                self._fp(outer="oops", viewport="1440x900"), {"os": "macos"}, []
+            ),
+            [],
+        )
+
+
+class AccountExistsTerminalTests(unittest.TestCase):
+    """「账号可能已存在」必须终局：不换邮箱重试 + 标记原邮箱耗尽。"""
+
+    def test_no_retry_and_marks_original_mailbox(self):
+        import asyncio
+        from unittest.mock import patch
+
+        from app.config import settings
+        from app.services import registrator as rm
+        from app.services.mail_providers import icloud as ic
+
+        reg = rm.Registrator(smsbower_client=None)
+        calls = {"n": 0}
+        marked: list[str] = []
+        helper_calls: list[dict] = []
+
+        async def fake_once(*args, **kwargs):
+            calls["n"] += 1
+            kwargs["retry_ctx"]["email"] = f"acct-exists-{calls['n']}+abc@icloud.com"
+            raise rm.OpenAIErrorPageError("等待chatgpt_home时", label="账号可能已存在")
+
+        real_helper = rm._mark_icloud_root_exhausted
+
+        def spy_helper(retry_ctx):
+            helper_calls.append(dict(retry_ctx or {}))
+            return real_helper(retry_ctx)
+
+        with (
+            patch.object(settings, "mail_provider", "icloud"),
+            patch.object(reg, "_register_by_email_once", fake_once),
+            patch.object(rm, "_mark_icloud_root_exhausted", spy_helper),
+            patch.object(ic, "mark_root_exhausted", lambda x: marked.append(x) or True),
+            patch.object(ic, "_resolve_original_mailbox", lambda x: "acct-exists"),
+        ):
+            with self.assertRaises(rm.OpenAIErrorPageError):
+                asyncio.run(reg.register_by_email(proxy="http://127.0.0.1:7890", profile_path="D:/tmp/p", max_retries=3))
+
+        self.assertEqual(calls["n"], 1, f"账号已存在必须终局，不得换邮箱重试; helper_calls={helper_calls}")
+        self.assertEqual(len(helper_calls), 1, "必须调用标记 helper")
+        self.assertEqual(marked, ["acct-exists-1+abc@icloud.com"], "标记必须收到本轮地址")

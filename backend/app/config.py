@@ -51,8 +51,7 @@ class Settings(BaseSettings):
     clash_controller_secret: str = "set-your-secret"
     clash_selector_name: str = "良心云"
     clash_rotate_settle_seconds: float = 1.5
-    clash_rotate_max_attempts: int = 12
-    # 节点选择策略：round_robin=按订阅列表顺序依次后移（可预测、便于复现）；
+    clash_rotate_max_attempts: int = 12    # 节点选择策略：round_robin=按订阅列表顺序依次后移（可预测、便于复现）；
     # random=每次在候选池里随机挑，出口 IP 序列没有固定周期。
     clash_rotation_order: str = "round_robin"
     # 与主组一起切到同一节点的其它代理组（逗号分隔组名）。用于"整台机器出口一致换 IP"。
@@ -73,6 +72,9 @@ class Settings(BaseSettings):
     # OAuth 独立地区过滤（逗号分隔，留空=跟随 clash_allowed_region_keywords）。
     # 例：注册用日本，OAuth 用美国时，这里填 🇺🇸,美国,US
     oauth_clash_allowed_region_keywords: str = ""
+    # OAuth 独立节点白名单（逗号分隔，留空=跟随 clash_allowed_node_keywords）。
+    # 例：美国高速01|bgp|cucm,美国高速02|bgp|cucm,…  OAuth 只在这些节点间轮换。
+    oauth_clash_allowed_node_keywords: str = ""
     # OAuth 启动前的 Clash 轮换最多等待多久，避免任务永久停在准备阶段。
     oauth_clash_rotate_timeout_seconds: float = 30.0
     # 空闲期定时轮换：OAuth job 只在启动时换一次节点，之后长时间钉在同一出口 IP。
@@ -91,6 +93,8 @@ class Settings(BaseSettings):
     # Codex OAuth 后台 job 只保留有限终态历史，防止内存字典无限增长。
     oauth_job_ttl_seconds: int = 6 * 60 * 60
     oauth_job_max_history: int = 100
+    # 失败账号自动重建下一轮 job 前的冷却间隔：给 IP/账号状态留出换节点降温时间。
+    oauth_rebuild_cooldown_seconds: float = 30.0
     # 浏览器/Playwright 孤儿进程 watchdog：只清理本项目 profiles 下的陈旧进程。
     process_watchdog_enabled: bool = True
     process_watchdog_interval_seconds: int = 5 * 60
@@ -169,8 +173,9 @@ class Settings(BaseSettings):
     icloud_accounts_pool: str = ""
     icloud_poll_interval: int = 4
     icloud_poll_timeout: int = 180
-    # 分裂模式（纯别名）：打开后只注册 root+tag@域 的派生地址，原邮箱（基础地址）
-    # 本身不再分配；关闭时原样取池中的邮箱注册。
+    # 分裂模式（纯别名）：打开后只注册「原邮箱+tag@域」的派生地址（池中每行
+    # 即原邮箱，含其自带的 + 段，如 salvo.swarm6l+ba67+xxx@icloud.com），
+    # 原邮箱本身不再分配；关闭时原样取池中的邮箱注册。
     # 是否生效取决于收信服务是否做 + 别名归一(tongsheep 实测支持；yunapi 待验证)。
     icloud_split_enabled: bool = False
     icloud_split_prefix: str = ""

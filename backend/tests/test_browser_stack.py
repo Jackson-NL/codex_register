@@ -1,4 +1,5 @@
 import asyncio
+import random
 import sys
 from pathlib import Path
 
@@ -286,3 +287,123 @@ def test_build_launch_options_actually_passes_block_webrtc():
         "http://127.0.0.1:7890", "D:/p/x", headless=True, env=None, block_webrtc=True
     )
     assert blocked["block_webrtc"] is True
+
+
+def test_viewport_pool_follows_market_share_weights():
+    """视口必须按市场份额加权：头部分辨率占比高、冷门值低，且无池外值。
+
+    均匀随机（旧行为）会产生「每个值 ~14%」的人类群体中统计不可能的边缘分布，
+    反欺诈侧单看边际分布即可判定非人类——这里锁死加权形态。
+    """
+    draws = [browser_stack.random_environment("JP")["viewport"] for _ in range(3000)]
+    sizes = {(d["width"], d["height"]) for d in draws}
+    assert sizes <= set(browser_stack.VIEWPORTS)
+
+    def share(size):
+        return sum(1 for d in draws if (d["width"], d["height"]) == size) / len(draws)
+
+    top = share((1920, 1080))
+    second = share((1366, 768))
+    tail = share((1024, 768))
+    assert top > 0.15, f"1920x1080 占比应接近 22%: {top:.3f}"
+    assert top > second > tail, f"头部递增收敛失败: {top:.3f}/{second:.3f}/{tail:.3f}"
+    assert tail < 0.02, f"冷门值 1024x768 应 <2%: {tail:.3f}"
+    # 前三款合计应覆盖多数样本（真实人口前三大分辨率 ~50%）
+    top3 = top + second + share((1536, 864))
+    assert top3 > 0.35, f"前三分辨率合计应 ~45%: {top3:.3f}"
+
+
+def test_os_distribution_skews_windows():
+    """os 按桌面市场份额加权：Windows 应显著多数，但不能是单一值。"""
+    draws = [browser_stack.random_environment("JP")["os"] for _ in range(2000)]
+    windows_share = draws.count("windows") / len(draws)
+    assert 0.65 < windows_share < 0.90, f"Windows 占比应 ~78%: {windows_share:.3f}"
+    assert "macos" in draws
+
+
+def test_dsf_distribution_skews_common_scaling():
+    """dsf 按 os 条件加权：Windows 以 1.0(100% 缩放)为主，macOS 以 2.0(Retina)为主。"""
+    windows: list[float] = []
+    macos: list[float] = []
+    for _ in range(1500):
+        env = browser_stack.random_environment("JP")
+        (macos if env["os"] == "macos" else windows).append(env["device_scale_factor"])
+    win_flat = sum(1 for d in windows if d == 1.0) / max(1, len(windows))
+    assert win_flat > 0.5, f"Windows 1.0 应 ~72%: {win_flat:.3f}"
+    macos_retina = sum(1 for d in macos if d == 2.0) / max(1, len(macos))
+    assert macos_retina > 0.5, f"macOS 2.0 应 ~90%: {macos_retina:.3f}"
+
+
+def test_macos_viewport_pool_excludes_4k():
+    """macOS 不抽 3840x2160：Retina Mac 配 8K 显示器真实占比 ~0.01%，
+    抽中即产生稀有组合；4K 留给 Windows（dpr=1 的 4K 屏是常见形态）。"""
+    for _ in range(300):
+        env = browser_stack.random_environment("JP")
+        if env["os"] == "macos":
+            assert (env["viewport"]["width"], env["viewport"]["height"]) != (3840, 2160)
+    assert (3840, 2160) in browser_stack.VIEWPORTS  # Windows 侧仍可抽到
+    assert (3840, 2160) not in browser_stack.VIEWPORTS_MACOS
+
+
+# ------------------------------------------------------------------
+# 鼠标轨迹剖面：拟人化运动学（过冲修正/步数随距离缩放/视口内/可复现）
+# ------------------------------------------------------------------
+
+def test_plan_mouse_path_scales_steps_with_distance():
+    """步数必须随距离缩放：旧版固定 3-6 步，远近距离同形态是可聚类信号。"""
+    def avg_steps(dist):
+        total = 0
+        for _ in range(200):
+            path = browser_stack.plan_mouse_path(100, 100, 100 + dist, 100)
+            total += len(path)
+        return total / 200
+
+    short = avg_steps(200)
+    long = avg_steps(1200)
+    assert long > short + 2, f"远距离步数应显著更多: {short:.1f} vs {long:.1f}"
+
+
+def test_plan_mouse_path_overshoot_exceeds_target_then_returns():
+    """过冲剖面：必须先冲过目标再修正回位——真人瞄准的最强行为签名。"""
+    path = browser_stack.plan_mouse_path(100, 500, 1000, 500, rng=random.Random(7), profile="overshoot")
+    xs = [x for x, _y, _d in path]
+    assert max(xs) > 1000 + 30, f"应冲过目标 5-15%: max_x={max(xs):.0f}"
+    assert abs(xs[-1] - 1000) <= 30, f"终点必须修回目标邻域: {xs[-1]:.0f}"
+    # 修正阶段（冲过峰值之后）应比弹道阶段慢
+    delays = [d for _x, _y, d in path]
+    peak_idx = max(range(len(xs)), key=lambda i: xs[i])
+    tail_avg = sum(delays[peak_idx + 1:]) / max(1, len(delays) - peak_idx - 1)
+    head_avg = sum(delays[: peak_idx + 1]) / max(1, peak_idx + 1)
+    assert tail_avg > head_avg * 1.3, f"修正阶段应显著更慢: {tail_avg:.1f} vs {head_avg:.1f}"
+
+
+def test_plan_mouse_path_stays_within_bounds_and_ends_near_target():
+    """所有剖面：坐标不越视口、终点落在目标邻域（含 ±2px 震颤余量）。"""
+    bounds = (1280, 720)
+    for profile in ("standard", "overshoot", "variable"):
+        for seed in range(60):
+            rng = random.Random(seed)
+            path = browser_stack.plan_mouse_path(200, 150, 900, 600, rng=rng, bounds=bounds, profile=profile)
+            assert len(path) >= 3
+            assert all(0 <= x <= 1280 and 0 <= y <= 720 for x, y, _d in path), profile
+            assert all(d > 0 for _x, _y, d in path), profile
+            last_x, last_y = path[-1][0], path[-1][1]
+            assert abs(last_x - 900) <= 30 and abs(last_y - 600) <= 30, profile
+
+
+def test_plan_mouse_path_deterministic_with_seed():
+    """同种子必须可复现（测试钉死行为用）。"""
+    p1 = browser_stack.plan_mouse_path(100, 100, 800, 400, rng=random.Random(42))
+    p2 = browser_stack.plan_mouse_path(100, 100, 800, 400, rng=random.Random(42))
+    assert p1 == p2
+
+
+def test_plan_mouse_path_variable_profile_has_mid_pause():
+    """变速剖面：应存在一步延时显著高于其余步（30-80ms 握持停顿）。"""
+    pauses = 0
+    for seed in range(80):
+        path = browser_stack.plan_mouse_path(100, 100, 1000, 500, rng=random.Random(seed), profile="variable")
+        delays = sorted(d for _x, _y, d in path)
+        if delays[-1] > delays[-2] * 1.8:
+            pauses += 1
+    assert pauses >= 40, f"多数变速手势应带停顿: {pauses}/80"

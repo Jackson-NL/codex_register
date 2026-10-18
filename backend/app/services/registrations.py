@@ -463,13 +463,13 @@ class RegistrationService:
                     if settings.mail_provider == "icloud" and "可能已存在" in safe_msg and mark_source:
                         try:
                             from .registrator import emit_log
-                            from .mail_providers.icloud import _split_root, mark_root_exhausted
+                            from .mail_providers.icloud import _resolve_original_mailbox, mark_root_exhausted
 
-                            root = _split_root(mark_source)
-                            mark_root_exhausted(root)
+                            root = _resolve_original_mailbox(mark_source)
+                            mark_root_exhausted(mark_source)
                             emit_log(
                                 f"[registration:{reg_id}] [split] 触发「账号可能已存在」 "
-                                f"(address={mark_source})，root={root} 已标记耗尽，后续轮换跳过"
+                                f"(address={mark_source})，原邮箱={root} 已标记耗尽，后续轮换跳过"
                             )
                         except Exception:  # noqa: BLE001
                             pass

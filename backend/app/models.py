@@ -372,3 +372,17 @@ class IcloudKnownRegistered(Base):
 
     email: Mapped[str] = mapped_column(String(255), primary_key=True)
     marked_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+class IcloudCodeTimeout(Base):
+    """iCloud：等验证码超时的邮箱地址（收信 API 收不到码）。
+
+    单次超时即永久跳过（用户明确选择）：共享池环境下这类地址反复中招，
+    10 分钟分配窗挡不住跨批次复发，每复发一次白烧一个浏览器会话 + 3 分钟。
+    只标地址本身，不连带 root。
+    """
+
+    __tablename__ = "icloud_code_timeouts"
+
+    email: Mapped[str] = mapped_column(String(255), primary_key=True)
+    marked_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)

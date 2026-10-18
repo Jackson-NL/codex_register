@@ -9,8 +9,9 @@
 import asyncio
 import re
 import secrets
+import socket
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -27,8 +28,8 @@ _REGISTERED_TTL = 60.0
 # 本进程已分配邮箱（10 分钟内不重复分配）：防止并发/缓存窗口内重复取同一邮箱。
 _ALLOCATED_TTL = 600.0
 _ALLOCATED: dict[str, float] = {}
-# 已判定「账号可能已存在」而耗尽的 root（基础邮箱本地部分，去掉 + 段）：
-# 分裂/普通池分配均跳过，避免对已到上限的基础邮箱反复空转。
+# 已判定「账号可能已存在」而耗尽的原邮箱（本地部分全段，含其自带的 + 段）：
+# 分裂/普通池分配均跳过，避免对已到上限的原邮箱反复空转。
 # 内存集合之外落 DB（IcloudExhaustedRoot）：重启不丢，杜绝同一个烧毁的
 # 基础邮箱在下次启动后又被取出、反复撞「账号可能已存在」。
 _EXHAUSTED_ROOTS: set[str] = set()
@@ -37,6 +38,10 @@ _EXHAUSTED_LOADED = False
 # 重启不丢——否则 10 分钟分配窗一过，烧毁的地址又会被取出来再烧一轮。
 _KNOWN_REGISTERED: set[str] = set()
 _KNOWN_REGISTERED_LOADED = False
+# 等验证码超时的地址（收信 API 收不到码）：单次超时即永久跳过（用户明确选择）。
+# 只标地址本身，不连带 root；内存 + DB 双写，重启不丢。
+_CODE_TIMEOUTS: set[str] = set()
+_CODE_TIMEOUTS_LOADED = False
 
 
 def _normalize_pool_text(pool_text: str) -> str:
@@ -102,7 +107,7 @@ def _build_mail_url(api_url: str, email: str) -> str:
     """把收信 API 拼成请求。
 
     - wdmail 风格(api 以 '?' 或 '&' 结尾):拼 f=json&e=<邮箱>,按邮箱取信。
-      邮箱必须 URL 编码:分裂地址 root+tag@域 里的 '+' 在 query string 中会被
+      邮箱必须 URL 编码:分裂地址 原邮箱+tag@域 里的 '+' 在 query string 中会被
       服务端解码成空格,不编码将按错误地址查信(表现为收码超时)。
     - 其它(yunapi / tongsheep 等,key/token 已绑定收件邮箱):原样请求即可。
     """
@@ -134,7 +139,10 @@ def _extract_code_from_message(message: dict) -> str | None:
 
 # 收信 API 连续失败阈值：达到即判定「接口不可用」而非「邮件未到」，快速失败，
 # 不把整轮 poll_timeout（默认 180s）耗在一个已挂掉的收信 API 上。
-_API_FAILURE_STREAK_LIMIT = 3
+# 注意：邮件刚到达时服务商接口可能短暂返回非 200/非 JSON（处理中），阈值太低
+# 会把「码在路上」误判成「接口挂了」而提前放弃——实测 4s 间隔下 3 次失败≈12s
+# 就退出，明显早于预期 180s 等待窗口，故放宽到 8 次（≈32s）再判接口不可用。
+_API_FAILURE_STREAK_LIMIT = 8
 
 
 async def _fetch_mail_payload(client: httpx.AsyncClient, url: str) -> tuple[object, str]:
@@ -142,6 +150,8 @@ async def _fetch_mail_payload(client: httpx.AsyncClient, url: str) -> tuple[obje
 
     error 非空表示本次请求失败（网络异常 / 非 200 / 响应不可解析）；
     描述只含状态码或异常类型名，绝不携带 URL——query 里可能带 token/key。
+    为便于定位「注册期间 ConnectError」类问题，异常会附带底层原因关键词
+    （如 WinError 10061=拒绝 / 11001=DNS 失败 / 10060=超时），不含 URL。
     """
     try:
         resp = await client.get(url)
@@ -149,7 +159,21 @@ async def _fetch_mail_payload(client: httpx.AsyncClient, url: str) -> tuple[obje
             return None, f"HTTP {resp.status_code}"
         return resp.json(), ""
     except Exception as error:  # noqa: BLE001
-        return None, type(error).__name__
+        cause = str(error)
+        if error.__cause__ is not None:
+            cause = f"{cause} | cause: {str(error.__cause__)[:120]} | cause_args={getattr(error.__cause__, 'args', ())[:3]}"
+        if not cause.strip():
+            cause = type(error).__name__
+        # 现场 DNS 探测：注册进程内解析结果能区分「fake-ip/解析失败/真实 IP」。
+        dns_note = ""
+        try:
+            host = urlsplit(url).hostname or ""
+            port = urlsplit(url).port or 443
+            resolved = socket.getaddrinfo(host, port)[:3]
+            dns_note = f" | dns={host}->{[item[4][0] for item in resolved]}"
+        except Exception as dns_error:  # noqa: BLE001
+            dns_note = f" | dns ERR {type(dns_error).__name__}:{str(dns_error)[:80]}"
+        return None, f"{type(error).__name__}: {cause[:200]}{dns_note}"
 
 
 def _extract_code_from_payload(payload: object) -> str | None:
@@ -179,10 +203,45 @@ def _extract_code_from_payload(payload: object) -> str | None:
     return None
 
 
-def _split_root(email: str) -> str:
-    """分裂模式基础根：取 @ 前去掉所有 + 段的部分（root+tag@域）。"""
-    local = str(email or "").partition("@")[0]
-    return local.split("+", 1)[0]
+def _mailbox_root(email: str) -> str:
+    """邮箱的「原邮箱」标识：@ 前的完整本地部分（含其自带的 + 段）。
+
+    池子里每行（例如 salvo.swarm6l+ba67@icloud.com）就是一个原邮箱，
+    分裂别名往完整本地部分后面追加：salvo.swarm6l+ba67+xxx@icloud.com。
+    不再剥掉已有 + 段——那会把同一原邮箱的手写别名错当成根。
+    """
+    return str(email or "").partition("@")[0]
+
+
+def _resolve_original_mailbox(address: str) -> str:
+    """把任意注册地址归一到池中的「原邮箱」本地部分（耗尽标记用）。
+
+    分裂别名 = 原邮箱本地部分 + '+' + tag；但原邮箱本身可能自带 + 段
+    （salvo.swarm6l+ba67@），所以既不能剥第一段也不能盲剥最后一段，必须对
+    池做**最长前缀匹配**：local == 池行 local，或 local 以 池行 local + '+' 开头。
+    池不可用/地址不在池中时，退化为"剥掉最后一段"（视作派生别名，生成 tag 不含 +）。
+    """
+    local, _, domain = str(address or "").partition("@")
+    if not local:
+        return ""
+    if not domain:
+        # 无 @ = 传入的已经是原邮箱本地部分本身（如 mark_root_exhausted 内部的
+        # 二次调用）：直接返回，避免被当派生别名误剥掉自带的 + 段。
+        return local
+    best = ""
+    try:
+        for email, _api in validate_icloud_pool(settings.icloud_accounts_pool)[0]:
+            pool_local, _, pool_domain = str(email).partition("@")
+            if not pool_local or pool_domain != domain:
+                continue
+            if local == pool_local or local.startswith(f"{pool_local}+"):
+                if len(pool_local) > len(best):
+                    best = pool_local
+    except Exception:  # noqa: BLE001
+        best = ""
+    if best:
+        return best
+    return local.rsplit("+", 1)[0] if "+" in local else local
 
 
 def _ensure_exhausted_roots_loaded() -> None:
@@ -209,12 +268,13 @@ def _ensure_exhausted_roots_loaded() -> None:
 
 
 def mark_root_exhausted(email_or_root: str) -> bool:
-    """标记 root 耗尽：内存 + DB 双写；返回是否成功落库。
+    """标记原邮箱耗尽：内存 + DB 双写；返回是否成功落库。
 
-    注册遇到「账号可能已存在」时调用——该基础邮箱的别名空间已被 OpenAI
-    判定占用，后续分配（分裂/普通池）全部跳过，重启后依然有效。
+    注册遇到「账号可能已存在」时调用——传入的可能是派生别名（分裂模式）
+    或池中原邮箱（非分裂模式），先对池做最长前缀匹配归一到原邮箱本地部分，
+    后续分配（分裂/普通池）全部跳过，重启后依然有效。
     """
-    root = _split_root(email_or_root) if email_or_root else ""
+    root = _resolve_original_mailbox(email_or_root) if email_or_root else ""
     if not root:
         return False
     _EXHAUSTED_ROOTS.add(root)
@@ -286,17 +346,125 @@ def mark_email_registered(email: str) -> bool:
         return False
 
 
+def _ensure_code_timeouts_loaded() -> None:
+    """进程内懒加载一次：把 DB 中等码超时的地址读进内存集合。"""
+    global _CODE_TIMEOUTS_LOADED
+    if _CODE_TIMEOUTS_LOADED:
+        return
+    _CODE_TIMEOUTS_LOADED = True
+    try:
+        from ...db import SessionLocal
+        from ...models import IcloudCodeTimeout
+
+        db = SessionLocal()
+        try:
+            rows = db.query(IcloudCodeTimeout.email).all()
+            _CODE_TIMEOUTS.update(str(row[0]) for row in rows if row[0])
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def mark_code_timeout(email: str) -> bool:
+    """标记邮箱「等码超时」：内存 + DB 双写；返回是否成功落库。
+
+    注册时验证码轮询等满超时即调用——该地址的收信 API 收不到码。**同时耗尽
+    其原邮箱**（对池做最长前缀匹配归一）：同一原邮箱的别名复用同一收信 API，
+    一个别名收不到码，兄弟别名同样收不到——只标别名的话，10 分钟分配窗
+    一过就会生成新别名再烧 3 分钟等码（实测一个原邮箱连烧 4 个别名）。
+    """
+    address = str(email or "").strip()
+    if not address:
+        return False
+    _CODE_TIMEOUTS.add(address)
+    original = _resolve_original_mailbox(address)
+    if original:
+        mark_root_exhausted(original)
+    try:
+        from ...db import SessionLocal
+        from ...models import IcloudCodeTimeout
+
+        db = SessionLocal()
+        try:
+            if db.get(IcloudCodeTimeout, address) is None:
+                db.add(IcloudCodeTimeout(email=address))
+                db.commit()
+        finally:
+            db.close()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _family(email: str) -> str:
+    """OpenAI 判重口径的「家族」：本地部分第一个 + 之前的部分。
+
+    实测：一个家族有任一账号注册成功后，其新 + 别名会被判「已存在」
+    （pickle.sophist-8o 家族 5/5 个新别名全撞已存在 —— 该家族 +e473 已注册）。
+    故剩余可注册量必须按未烧家族计，而不是按池行数：池行数会严重虚高
+    （实测 97 行 vs 1 个可用家族）。
+    """
+    return str(email or "").partition("@")[0].split("+", 1)[0]
+
+
+def _burned_families(registered: set[str] | None = None) -> set[str]:
+    """已烧家族集合：家族内任一地址命中任一来源即整族不可再用。
+
+    来源与估算口径完全一致：accounts 已注册 / 已注册确认 / 等码超时 /
+    原邮箱耗尽 / 本进程 10 分钟分配窗。分配器与估算共用，避免出现
+    "估算说只剩 1 个、分配器却取已烧家族"的不一致（实测踩过）。
+    """
+    burned: set[str] = set()
+    for email in (registered or set()):
+        burned.add(_family(email))
+    for email in _KNOWN_REGISTERED:
+        burned.add(_family(email))
+    for email in _CODE_TIMEOUTS:
+        burned.add(_family(email))
+    for root in _EXHAUSTED_ROOTS:
+        burned.add(_family(root))
+    # 只算仍在 10 分钟窗内的分配：过窗后失败地址应可重试，不能永久计入已烧。
+    now = time.time()
+    for email, ts in _ALLOCATED.items():
+        if (now - ts) < _ALLOCATED_TTL:
+            burned.add(_family(email))
+    return burned
+
+
+def _registered_account_emails() -> set[str]:
+    """accounts 表全部邮箱。
+
+    分配器要按「家族」排除，就必须看到整张 accounts 表——池内精确匹配
+    查不到"同家族、不同别名"的已注册账号，而那正是 OpenAI 判重的口径。
+    全表 ~1500 行的取列查询 <5ms，不做缓存避免写入后读到陈旧集合。
+    """
+    emails: set[str] = set()
+    try:
+        from ...db import SessionLocal
+        from ...models import Account
+        from sqlalchemy import select as sa_select
+
+        db = SessionLocal()
+        try:
+            rows = db.execute(sa_select(Account.email)).scalars().all()
+            emails = {str(email) for email in rows if email}
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001
+        emails = set()
+    return emails
+
+
 def estimate_remaining_rounds(provider: "ICloudProvider | None" = None) -> dict:
-    """估算剩余可注册轮数（注册工作台展示用）。
+    """估算剩余可注册轮数（注册工作台展示用）——与分配器实际可取出量一致。
 
-    - 非分裂（原邮箱模式）：池中邮箱数 - 已用（已注册入库 / 10 分钟分配窗 /
-      root 已耗尽）。每轮消耗一个池邮箱。
-    - 分裂（别名模式）：未耗尽且仍有别名坑位的基础邮箱（root）数。每轮消耗
-      一个 root 的一个别名坑位；root 按「1 轮」计（别名的具体坑位数由
-      split_max_per_base 控制，超出即视为该 root 暫停产出）。
-    - split_max_per_base=0（不限）时，所有未耗尽 root 都计 1 轮。
-
-    DB 不可用降级为仅按进程内状态估算，不影响展示。
+    口径（跟随实际分配逻辑）：
+    - 带 + 条目（不可分裂）：原样地址未被注册/已知/超时/近 10 分钟已分配 → 计 1 轮；
+    - 无 + 条目（可分裂基础）：主地址(root@域)先 1 次、派生各 1 次，
+      剩余轮 = max_per_base - 已用（已用=主已注册/已分配 + 派生已注册/已分配）；
+    - 已判定耗尽(_EXHAUSTED_ROOTS)的 root 不计。
+    不再按家族归一合并（实测 + 地址是独立账号，同一 root 可主+派生各出）。
     """
     if provider is None:
         provider = ICloudProvider()
@@ -312,80 +480,91 @@ def estimate_remaining_rounds(provider: "ICloudProvider | None" = None) -> dict:
 
     _ensure_exhausted_roots_loaded()
     _ensure_known_registered_loaded()
-    now = time.time()
-    allocated_recent = {
-        email for email, ts in _ALLOCATED.items() if now - ts < _ALLOCATED_TTL
-    }
+    _ensure_code_timeouts_loaded()
 
-    registered: set[str] = set()
+    db = None
     try:
         from ...db import SessionLocal
         from ...models import Account
         from sqlalchemy import select as sa_select
+        from sqlalchemy import func as sa_func
 
         db = SessionLocal()
-        try:
-            rows = db.execute(sa_select(Account.email)).scalars().all()
-            registered = {str(email) for email in rows if email}
-        finally:
-            db.close()
-    except Exception:  # noqa: BLE001
-        registered = set()
 
-    if not provider.split_enabled:
+        def registered(email: str) -> bool:
+            return bool(db.scalar(sa_select(Account.id).where(Account.email == email)))
+
+        def recent_allocated(email: str) -> bool:
+            return any(
+                e == email and (now - ts) < _ALLOCATED_TTL
+                for e, ts in _ALLOCATED.items()
+            )
+
+        now = __import__("time").time()
+        if not provider.split_enabled:
+            # 未分裂模式：池中每条「未注册/未分配/未耗尽」的邮箱原样算 1 轮。
+            remaining = 0
+            for email, _api in pool:
+                root = _mailbox_root(email)
+                if root in _EXHAUSTED_ROOTS:
+                    continue
+                if email in _KNOWN_REGISTERED or email in _CODE_TIMEOUTS:
+                    continue
+                if recent_allocated(email) or registered(email):
+                    continue
+                remaining += 1
+            result["remaining"] = int(remaining)
+            result["exhausted_roots"] = len({_mailbox_root(e) for e, _a in pool} & _EXHAUSTED_ROOTS)
+            return result
+
+        # 分裂模式：带 + 条目原样算 1 轮；无 + 基础按「max_per_base - 已用」算派生额度。
+        cap = provider.split_max_per_base if provider.split_max_per_base and provider.split_max_per_base > 0 else 999_999
         remaining = 0
+        counted_bases: set[str] = set()
         for email, _api in pool:
-            if email in registered or email in allocated_recent:
+            local = email.partition("@")[0]
+            domain = email.partition("@")[2]
+            root = _mailbox_root(email)
+            if root in _EXHAUSTED_ROOTS:
                 continue
-            if email in _KNOWN_REGISTERED:
-                continue
-            if _split_root(email) in _EXHAUSTED_ROOTS:
-                continue
-            remaining += 1
-        result["remaining"] = remaining
-        result["exhausted_roots"] = sum(
-            1 for root in {_split_root(email) for email, _ in pool} if root in _EXHAUSTED_ROOTS
-        )
+            if "+" in local:
+                # 不可分裂：原样地址可用即 1 轮
+                if email not in _KNOWN_REGISTERED and email not in _CODE_TIMEOUTS:
+                    if not recent_allocated(email) and not registered(email):
+                        remaining += 1
+            else:
+                # 可分裂基础：同一 root 只计一次额度
+                if root in counted_bases:
+                    continue
+                counted_bases.add(root)
+                root_addr = f"{root}@{domain}"
+                used = 1 if registered(root_addr) or recent_allocated(root_addr) else 0
+                escaped = root.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                derived_registered = int(
+                    db.scalar(
+                        sa_select(sa_func.count())
+                        .select_from(Account)
+                        .where(Account.email.like(f"{escaped}+%@{domain}", escape="\\"))
+                    )
+                    or 0
+                )
+                derived_allocated = sum(
+                    1
+                    for e, ts in _ALLOCATED.items()
+                    if (now - ts) < _ALLOCATED_TTL
+                    and e.startswith(f"{root}+")
+                    and e.endswith(f"@{domain}")
+                    and not registered(e)
+                )
+                used += derived_registered + derived_allocated
+                remaining += max(0, cap - used)
+
+        result["remaining"] = int(remaining)
+        result["exhausted_roots"] = len({_mailbox_root(e) for e, _a in pool} & _EXHAUSTED_ROOTS)
         return result
-
-    # 分裂模式：按 root 聚合——已注册派生地址数 + 10 分钟分配窗派生地址数。
-    derived_used: dict[str, int] = {}
-    for email in registered:
-        if "+" not in email:
-            continue
-        local, _, domain = email.partition("@")
-        root = local.split("+", 1)[0]
-        if root:
-            derived_used[root] = derived_used.get(root, 0) + 1
-    for email in allocated_recent:
-        if "+" not in email:
-            continue
-        local, _, domain = email.partition("@")
-        root = local.split("+", 1)[0]
-        if root:
-            derived_used[root] = derived_used.get(root, 0) + 1
-
-    roots: list[str] = []
-    seen: set[str] = set()
-    for email, _api in pool:
-        root = _split_root(email)
-        if root and root not in seen:
-            seen.add(root)
-            roots.append(root)
-    cap = provider.split_max_per_base
-    remaining = 0
-    exhausted = 0
-    for root in roots:
-        if root in _EXHAUSTED_ROOTS:
-            exhausted += 1
-            continue
-        if cap > 0 and derived_used.get(root, 0) >= cap:
-            exhausted += 1
-            continue
-        remaining += 1
-    result["remaining"] = remaining
-    result["exhausted_roots"] = exhausted
-    return result
+    finally:
+        if db is not None:
+            db.close()
 
 
 def _gen_tag(prefix: str, length: int) -> str:
@@ -415,7 +594,7 @@ class ICloudProvider(MailProvider):
         self.accounts, self.pool_errors = validate_icloud_pool(pool_text)
         self.poll_timeout = overrides.pop("poll_timeout", None) or settings.icloud_poll_timeout
         self.poll_interval = overrides.pop("poll_interval", None) or settings.icloud_poll_interval
-        # 纯别名开关：True=只取 root+tag@域 派生地址；False=原样取池中邮箱。
+        # 纯别名开关：True=只取「原邮箱+tag@域」派生地址；False=原样取池中邮箱。
         self.split_enabled = bool(_pick(overrides, "split_enabled", settings.icloud_split_enabled))
         self.split_prefix = _pick(overrides, "split_prefix", settings.icloud_split_prefix) or ""
         self.split_tag_length = int(_pick(overrides, "split_tag_length", settings.icloud_split_tag_length) or 6)
@@ -428,15 +607,17 @@ class ICloudProvider(MailProvider):
         return len(self.accounts) > 0
 
     async def _create_split_address(self) -> MailIdentity:
-        """分裂模式（纯别名）：只从池中基础邮箱派生 root+tag@域 的注册地址。
+        """分裂模式（纯别名）：只从池中原邮箱派生「原邮箱+tag@域」的注册地址。
 
-        - 原邮箱（基础地址 root@域）本身不再分配：打开分裂即纯别名模式，
-          基础邮箱保留（可能已注册过或另作他用），所有注册都走 + 别名。
-        - 同一基础邮箱复用其收信 API（是否收到派生地址的验证码取决于服务端 + 别名归一，
+        - 池中每行（含自带的 + 段）就是一个原邮箱：salvo.swarm6l+ba67@icloud.com
+          的别名形如 salvo.swarm6l+ba67+xxx@icloud.com（往完整本地部分追加）。
+        - 原邮箱本身不再分配：打开分裂即纯别名模式，原邮箱保留
+          （可能已注册过或另作他用），所有注册都走 + 别名。
+        - 同一原邮箱复用其收信 API（是否收到派生地址的验证码取决于服务端 + 别名归一，
           tongsheep 实测支持；不支持的服务表现为收码超时）。
         - 只拿一次：派生地址注册成功会写本地 accounts → 精确查询跳过；
           本进程 _ALLOCATED(10 分钟) 防并发/短窗重复；10 分钟后失败地址可被重取重试。
-        - split_max_per_base>0 时，产出达到上限的基础邮箱跳过。
+        - split_max_per_base>0 时，产出达到上限的原邮箱跳过。
         """
         now = time.time()
         db = None
@@ -446,25 +627,53 @@ class ICloudProvider(MailProvider):
             from sqlalchemy import select as sa_select
             from sqlalchemy import func as sa_func
 
-            bases: list[tuple[str, str, str]] = []  # (root, domain, api)
+            # 1) 不可分裂条目(地址本地部分含 +，如 pins.shy0e+71b9@…)：原样使用、不派生。
+            #    yunapi 等服务 key 绑定精确地址，派生新 +tag 收不到码，必须按原地址消费。
+            plus_entries = [
+                (email, api)
+                for email, api in self.accounts
+                if "+" in email.partition("@")[0]
+            ]
+            if plus_entries:
+                db = SessionLocal()
+                for attempt in range(len(plus_entries) * 5):
+                    email, api = plus_entries[(self._cursor + attempt) % len(plus_entries)]
+                    recent = any(e == email and (now - ts) < _ALLOCATED_TTL for e, ts in _ALLOCATED.items())
+                    if not recent and not db.scalar(sa_select(Account.id).where(Account.email == email)):
+                        self._cursor += 1
+                        _ALLOCATED[email] = now
+                        return MailIdentity(
+                            provider=self.name,
+                            address=email,
+                            credential={"api_url": api, "mode": self.mode, "split": False},
+                            meta={"pool_index": self._cursor, "split": False, "unspittable": True},
+                        )
+                # 带 + 条目全部已分配/已注册 → 落到可分裂池
+
+            bases: list[tuple[str, str, str]] = []  # (root, domain, api)；仅不含 + 的可分裂条目
             seen: set[str] = set()
             for email, api in self.accounts:
+                if "+" in email.partition("@")[0]:
+                    continue  # 不可分裂条目已在上面处理
                 domain = str(email).partition("@")[2]
-                root = _split_root(email)
+                root = _mailbox_root(email)
                 if root and root not in seen and root not in _EXHAUSTED_ROOTS:
                     seen.add(root)
                     bases.append((root, domain, api))
             if not bases:
-                raise MailProviderError("iCloud 分裂模式：池中无可用基础邮箱")
+                raise MailProviderError("iCloud 分裂模式：池中无可分配邮箱（可分裂基础均达上限或不可分裂条目已用尽）")
 
             db = SessionLocal()
 
             def base_used(root: str, domain: str) -> int:
-                """该基础邮箱已产出的派生地址数：已注册(accounts) + 本进程已分配(10 分钟)。
-                统计口径只算派生地址(root+tag@域)，原邮箱本身不计数也不分配。"""
-                # LIKE 通配符转义：root 可能含 _ 或 %，不转义会误匹配虚增计数。
+                """该可分裂基础已产出数：主地址(root@域) + 派生地址(root+tag@域)。
+                主地址「已注册 或 近 10 分钟已分配」只算 1 次(注册后 _ALLOCATED 仍残留，
+                不能双计否则刚注册完 10 分钟内就被判满额)；派生地址已注册的不再计 allocated。"""
+                root_addr = f"{root}@{domain}"
+                recent_root = any(e == root_addr and (now - ts) < _ALLOCATED_TTL for e, ts in _ALLOCATED.items())
+                cnt = 1 if (db.scalar(sa_select(Account.id).where(Account.email == root_addr)) or recent_root) else 0
                 escaped = root.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                cnt = int(
+                cnt += int(
                     db.scalar(
                         sa_select(sa_func.count())
                         .select_from(Account)
@@ -478,19 +687,32 @@ class ICloudProvider(MailProvider):
                     if (now - ts) < _ALLOCATED_TTL
                     and email.startswith(f"{root}+")
                     and email.endswith(f"@{domain}")
+                    and not db.scalar(sa_select(Account.id).where(Account.email == email))
                 )
                 return cnt
 
             total = len(bases)
-            # 从当前 cursor 轮换基础邮箱；每个取出的地址都是 root+tag@域 的派生别名。
             for attempt in range(total * 30):
                 root, domain, api = bases[(self._cursor + attempt) % total]
                 if self.split_max_per_base > 0 and base_used(root, domain) >= self.split_max_per_base:
                     continue
+                root_addr = f"{root}@{domain}"
+                # 主地址优先：未注册且未分配时先用主地址本身。
+                recent_root = any(e == root_addr and (now - ts) < _ALLOCATED_TTL for e, ts in _ALLOCATED.items())
+                if not recent_root and not db.scalar(sa_select(Account.id).where(Account.email == root_addr)):
+                    self._cursor += 1
+                    _ALLOCATED[root_addr] = now
+                    return MailIdentity(
+                        provider=self.name,
+                        address=root_addr,
+                        credential={"api_url": api, "mode": self.mode, "split": True},
+                        meta={"pool_index": self._cursor, "split": True, "root": root, "primary": True},
+                    )
+                # 主地址已用 → 派生一个别名
                 candidate = f"{root}+{_gen_tag(self.split_prefix, self.split_tag_length)}@{domain}"
                 if any(email == candidate and (now - ts) < _ALLOCATED_TTL for email, ts in _ALLOCATED.items()):
                     continue
-                if candidate in _KNOWN_REGISTERED:
+                if candidate in _KNOWN_REGISTERED or candidate in _CODE_TIMEOUTS:
                     continue
                 if db.scalar(sa_select(Account.id).where(Account.email == candidate)):
                     continue
@@ -512,6 +734,7 @@ class ICloudProvider(MailProvider):
     async def create_address(self) -> MailIdentity:
         _ensure_exhausted_roots_loaded()
         _ensure_known_registered_loaded()
+        _ensure_code_timeouts_loaded()
         if not self.has_pool:
             raise MailProviderError("iCloud 邮箱池为空，请先在「邮箱配置」中导入账号（邮箱----收信API）")
         if self.split_enabled:
@@ -548,7 +771,8 @@ class ICloudProvider(MailProvider):
             for email, api in self.accounts
             if email not in blocked
             and email not in _KNOWN_REGISTERED
-            and _split_root(email) not in _EXHAUSTED_ROOTS
+            and email not in _CODE_TIMEOUTS
+            and _mailbox_root(email) not in _EXHAUSTED_ROOTS
         ]
         if not remaining:
             raise MailProviderError(

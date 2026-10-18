@@ -163,6 +163,11 @@ class CodexOAuthJobBody(OAuthAutoPhoneBody):
     concurrency: int = Field(default=3, ge=1, le=10)
     # 账号重登只恢复现有登录态时可关闭手机号回退；普通 Codex OAuth 保持兼容默认开启。
     allow_phone_fallback: bool = True
+    # 失败账号自动重建下一轮 job，直到全部成功（封禁类失败除外）或手动停止。
+    auto_rebuild_failed: bool = True
+    # 内部字段：重建轮次与根 job id，由后端写入，调用方无需关心。
+    rebuild_round: int = 1
+    rebuild_root_job_id: str = ""
 
 
 class OAuthCountryOut(BaseModel):
@@ -723,6 +728,9 @@ def _oauth_job_snapshot(job: dict | None) -> dict | None:
         "error": job.get("error", ""),
         "started_at": job.get("started_at", ""),
         "finished_at": job.get("finished_at", ""),
+        "rebuild_round": int(job.get("rebuild_round") or 1),
+        "rebuild_root_job_id": str(job.get("rebuild_root_job_id") or ""),
+        "rebuild_pending": bool(job.get("rebuild_pending")),
     }
 
 
@@ -991,6 +999,111 @@ def _is_retryable_oauth_error(message: str) -> bool:
     return any(marker in lowered for marker in _RETRYABLE_OAUTH_MARKERS)
 
 
+# 账号真实状态问题：重跑无意义（封禁/停用/吊销/已删除），自动补跑时直接标记最终失败，
+# 不进入下一轮。与 _NON_RETRYABLE_OAUTH_MARKERS 不同：2FA/限流等可能随时间/换号解决，仍可补跑。
+_OAUTH_BANNED_MARKERS = (
+    "token revoked", "invalidated oauth token", "deactivated", "账号已停用",
+    "banned", "封禁", "account disabled", "disabled account", "账号不存在",
+)
+
+
+def _is_oauth_banned_account_error(message: str) -> bool:
+    lowered = str(message or "").lower()
+    return any(marker in lowered for marker in _OAUTH_BANNED_MARKERS)
+
+
+def _oauth_failed_account_results(job: dict) -> list[dict]:
+    return [
+        result for result in (job.get("results") or [])
+        if result.get("status") == "failed" and result.get("id")
+    ]
+
+
+async def _maybe_oauth_rebuild(job: dict, payload: CodexOAuthJobBody) -> None:
+    """本轮结束后，用失败账号自动重建下一轮 job，直到全部成功（封禁类失败除外）或手动停止。
+
+    封禁类失败(token revoked/停用/封禁/账号不存在)直接标记最终失败，不重进下一轮；
+    资格已变化的账号（如已写回 token）同样排除。每轮之间冷却 oauth_rebuild_cooldown_seconds，
+    冷却期间若用户手动启动了新 job，自动让位不再补跑。
+    """
+    global _ACTIVE_OAUTH_JOB_ID
+    failed = _oauth_failed_account_results(job)
+    if not failed:
+        job["rebuild_pending"] = False
+        return
+
+    db = SessionLocal()
+    try:
+        next_ids: list[int] = []
+        for result in failed:
+            account_id = int(result["id"])
+            if _is_oauth_banned_account_error(str(result.get("error") or "")):
+                result["rebuild_excluded"] = "banned"
+                continue
+            account = db.get(Account, account_id)
+            reason = "" if account else "账号不存在"
+            if not reason:
+                reason = oauth_block_reason(account) or ""
+            if reason:
+                result["rebuild_excluded"] = reason
+                continue
+            next_ids.append(account_id)
+    finally:
+        db.close()
+
+    if not next_ids:
+        job["rebuild_pending"] = False
+        emit_log(f"[oauth:rebuild] job_{job['job_id']} 失败账号均不可补跑(封禁/资格变更)，自动补跑结束", flush=True)
+        return
+
+    cooldown = max(0.0, float(getattr(settings, "oauth_rebuild_cooldown_seconds", 30.0) or 30.0))
+    if cooldown > 0:
+        emit_log(f"[oauth:rebuild] job_{job['job_id']} 下一轮补跑前冷却 {cooldown:.0f}s", flush=True)
+        await asyncio.sleep(cooldown)
+    # 冷却期间用户/其它入口启动了新 job → 让位，不再自动补跑（409 语义守护）。
+    if _ACTIVE_OAUTH_JOB_ID:
+        job["rebuild_pending"] = False
+        emit_log(f"[oauth:rebuild] job_{job['job_id']} 检测到新的活跃 job，放弃自动补跑", flush=True)
+        return
+
+    root_job_id = str(payload.rebuild_root_job_id or "") or str(job.get("job_id") or "")
+    next_round = int(payload.rebuild_round or 1) + 1
+    next_payload = payload.model_copy(update={
+        "account_ids": next_ids,
+        "rebuild_round": next_round,
+        "rebuild_root_job_id": root_job_id,
+    })
+    next_job_id = uuid4().hex[:12]
+    next_job = {
+        "job_id": next_job_id,
+        "status": "pending",
+        "account_ids": next_ids,
+        "current_account_id": None,
+        "current_flow": "direct",
+        "current_stage": -1,
+        "active_accounts": {},
+        "results": [],
+        "error": "",
+        "started_at": "",
+        "finished_at": "",
+        "concurrency": int(payload.concurrency),
+        "rebuild_round": next_round,
+        "rebuild_root_job_id": root_job_id,
+        "rebuild_pending": False,
+        "cancel_event": asyncio.Event(),
+        "task": None,
+    }
+    _OAUTH_JOBS[next_job_id] = next_job
+    _ACTIVE_OAUTH_JOB_ID = next_job_id
+    # 当前轮已交接给下一轮：标记 pending，前端据此继续跟随新 job。
+    job["rebuild_pending"] = True
+    next_job["task"] = asyncio.create_task(_run_codex_oauth_job(next_job_id, next_payload))
+    emit_log(
+        f"[oauth:rebuild] job_{next_job_id} 自动补跑第 {next_round} 轮(root=job_{root_job_id})：{len(next_ids)} 个失败账号",
+        flush=True,
+    )
+
+
 async def _run_codex_oauth_job(job_id: str, payload: CodexOAuthJobBody) -> None:
     global _ACTIVE_OAUTH_JOB_ID
     job = _OAUTH_JOBS[job_id]
@@ -1067,6 +1180,7 @@ async def _run_codex_oauth_job(job_id: str, payload: CodexOAuthJobBody) -> None:
                         selector_name=job.get("proxy_rotation_selector_name") or "",
                         proxy=job.get("proxy") or settings.default_proxy,
                         region_keywords=settings.oauth_clash_allowed_region_keywords or settings.clash_allowed_region_keywords,
+                        node_keywords=settings.oauth_clash_allowed_node_keywords or settings.clash_allowed_node_keywords,
                         log=lambda m: emit_log(m, flush=True),
                     ),
                     timeout=max(5.0, float(settings.oauth_clash_rotate_timeout_seconds or 30.0)),
@@ -1108,6 +1222,18 @@ async def _run_codex_oauth_job(job_id: str, payload: CodexOAuthJobBody) -> None:
         if _ACTIVE_OAUTH_JOB_ID == job_id:
             _ACTIVE_OAUTH_JOB_ID = None
         _prune_oauth_jobs()
+        # 失败账号自动重建下一轮 job（封禁类失败除外），直到全部成功或手动停止。
+        if payload.auto_rebuild_failed and job.get("status") == "failed":
+            job["rebuild_pending"] = True
+            try:
+                await _maybe_oauth_rebuild(job, payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception as rebuild_error:  # noqa: BLE001
+                job["rebuild_pending"] = False
+                emit_log(f"[oauth:rebuild] job_{job_id} 自动补跑调度异常：{str(rebuild_error)[:300]}", flush=True)
+        else:
+            job["rebuild_pending"] = False
 
 
 @router.post("/oauth/jobs")
@@ -1154,6 +1280,9 @@ async def create_codex_oauth_job(payload: CodexOAuthJobBody):
         "error": "",
         "started_at": "",
         "finished_at": "",
+        "rebuild_round": int(payload.rebuild_round or 1),
+        "rebuild_root_job_id": str(payload.rebuild_root_job_id or ""),
+        "rebuild_pending": False,
         "cancel_event": asyncio.Event(),
         "task": None,
     }

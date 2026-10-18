@@ -1077,3 +1077,54 @@ def test_explicit_selector_not_overridden_by_connection_majority(monkeypatch):
     assert result["ok"] is True
     assert switched == [("AI 服务", "✨ 美国02")]
     assert not any("改用实测代理组" in m for m in logs)
+
+
+# ------------------------------------------------------------------
+# 节点白名单：把轮换候选池锁到指定节点（如只允许 日本高速01-05）
+# ------------------------------------------------------------------
+
+def _allowlist_proxies():
+    names = [
+        "🇯🇵日本高速01|BGP|CUCM",
+        "🇯🇵日本高速05|BGP|CUCM",
+        "🇯🇵日本高速08|BGP|CTCU",
+        "🇯🇵日本高速01|CTCU|0.5x",
+    ]
+    proxies = {"GLOBAL": {"type": "Selector", "now": names[2], "all": list(names)}}
+    for n in names:
+        proxies[n] = {"type": "Vless"}
+    return proxies
+
+
+def test_node_allowlist_restricts_candidates(monkeypatch):
+    """白名单生效：候选只剩名称命中关键词的节点。"""
+    monkeypatch.setattr(clash_verge.settings, "clash_allowed_node_keywords", "日本高速01|BGP|CUCM,日本高速05|BGP|CUCM")
+    candidates = ordered_real_proxy_candidates(_allowlist_proxies(), "GLOBAL")
+
+    assert set(candidates) == {"🇯🇵日本高速01|BGP|CUCM", "🇯🇵日本高速05|BGP|CUCM"}
+
+
+def test_node_allowlist_substring_matches_all_variants(monkeypatch):
+    """子串匹配：关键词只写 日本高速01 会同时放行 0.5x 变体（所以 .env 用完整名）。"""
+    monkeypatch.setattr(clash_verge.settings, "clash_allowed_node_keywords", "日本高速01")
+
+    candidates = ordered_real_proxy_candidates(_allowlist_proxies(), "GLOBAL")
+
+    assert set(candidates) == {"🇯🇵日本高速01|BGP|CUCM", "🇯🇵日本高速01|CTCU|0.5x"}
+
+
+def test_node_allowlist_zero_hit_falls_back_unfiltered(monkeypatch):
+    """订阅换名导致白名单 0 命中：降级候选必须忽略白名单，避免轮换卡死。"""
+    monkeypatch.setattr(clash_verge.settings, "clash_allowed_node_keywords", "不存在的节点名")
+    proxies = _allowlist_proxies()
+
+    with pytest.raises(ValueError):
+        ordered_real_proxy_candidates(proxies, "GLOBAL")
+
+    fallback = clash_verge._unfiltered_candidates(proxies, "GLOBAL")
+    assert set(fallback) == {
+        "🇯🇵日本高速01|BGP|CUCM",
+        "🇯🇵日本高速05|BGP|CUCM",
+        "🇯🇵日本高速08|BGP|CTCU",
+        "🇯🇵日本高速01|CTCU|0.5x",
+    }

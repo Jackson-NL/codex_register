@@ -2177,11 +2177,11 @@ async def wait_for_page_transition(page, previous_url: str, patterns: list[str],
 
 
 def _mark_icloud_root_exhausted(retry_ctx: dict | None) -> str:
-    """iCloud 终局标记：把本轮用过的邮箱地址归一到 root 并标记耗尽。
+    """iCloud 终局标记：把本轮地址归一到池中原邮箱并标记耗尽。
 
-    仅当前邮箱 Provider 为 icloud 时生效；返回 root，其余情况返回空串。
-    标记内存 + DB 双写（icloud.mark_root_exhausted），重启后仍跳过该邮箱
-    的全部别名，不再撞同一堵「账号可能已存在」的墙。
+    仅当前邮箱 Provider 为 icloud 时生效；返回原邮箱本地部分，其余情况返回空串。
+    地址可能是派生别名（分裂模式）或池中原邮箱（非分裂模式），由
+    _resolve_original_mailbox 对池做最长前缀匹配归一。
     """
     if str(getattr(settings, "mail_provider", "") or "").lower() != "icloud":
         return ""
@@ -2189,10 +2189,10 @@ def _mark_icloud_root_exhausted(retry_ctx: dict | None) -> str:
     if not address:
         return ""
     try:
-        from .mail_providers.icloud import _split_root, mark_root_exhausted
+        from .mail_providers.icloud import _resolve_original_mailbox, mark_root_exhausted
 
-        root = _split_root(address)
-        mark_root_exhausted(root)
+        root = _resolve_original_mailbox(address)
+        mark_root_exhausted(address)
         return root
     except Exception:  # noqa: BLE001
         return ""
@@ -2205,6 +2205,51 @@ def _is_already_registered_error(error: BaseException) -> bool:
     异常消息里带 实际[login_password] 即判定该邮箱已有账号。
     """
     return "login_password" in str(error)
+
+
+def _fingerprint_mismatch_warnings(real_fp: dict, env: dict, tz_pool: list[str]) -> list[str]:
+    """运行时指纹核验：收集「计划值 ≠ 实际值 / 自相矛盾」的穿帮项。
+
+    覆盖四类信号（warn-only，不阻断注册流程）：
+    - 时区与出口地区不一致（历史真实事故：geoip 不注入运行时时区）
+    - navigator.platform 与启动 os 矛盾（MacIntel/Win32 是硬一致性信号）
+    - outer-inner < 60px：headless 无浏览器 chrome 的典型 tell
+    - colorDepth 与 os 明显不符（macOS 30 / Windows 24）
+
+    real_fp 为空或缺字段时静默跳过对应检查，绝不误报。
+    """
+    warnings: list[str] = []
+    if not real_fp:
+        return warnings
+
+    actual_tz = str(real_fp.get("timezone") or "")
+    if actual_tz and tz_pool and actual_tz not in tz_pool:
+        warnings.append(f"时区与出口地区不一致(期望池={tz_pool})")
+
+    os_name = str((env or {}).get("os") or "")
+    platform = str(real_fp.get("platform") or "")
+    if os_name and platform:
+        expect_platform = "MacIntel" if os_name == "macos" else "Win32"
+        if platform != expect_platform:
+            warnings.append(f"platform={platform} 与 os={os_name} 矛盾(期望 {expect_platform})")
+
+    outer = str(real_fp.get("outer") or "")
+    inner = str(real_fp.get("viewport") or "")
+    if outer and inner:
+        try:
+            _, outer_h = (int(x) for x in outer.split("x"))
+            _, inner_h = (int(x) for x in inner.split("x"))
+            if 0 < outer_h - inner_h < 60:
+                warnings.append(f"浏览器 chrome 高度异常(outer-inner={outer_h - inner_h}px,疑似 headless 无边框)")
+        except ValueError:
+            pass
+
+    color_depth = real_fp.get("colorDepth")
+    if os_name and isinstance(color_depth, (int, float)) and not isinstance(color_depth, bool):
+        expect_depth = 30 if os_name == "macos" else 24
+        if int(color_depth) != expect_depth:
+            warnings.append(f"colorDepth={int(color_depth)} 与 os={os_name} 不符(期望 {expect_depth})")
+    return warnings
 
 
 def _mark_icloud_email_registered(retry_ctx: dict | None) -> str:
@@ -2222,6 +2267,26 @@ def _mark_icloud_email_registered(retry_ctx: dict | None) -> str:
         from .mail_providers.icloud import mark_email_registered
 
         mark_email_registered(address)
+        return address
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _mark_icloud_code_timeout(retry_ctx: dict | None) -> str:
+    """iCloud 终局标记：把本轮地址标记为「等码超时」并返回该地址。
+
+    仅当前邮箱 Provider 为 icloud 时生效；单次超时即永久跳过
+    （icloud.mark_code_timeout，内存 + DB 双写），重启后不再取出。
+    """
+    if str(getattr(settings, "mail_provider", "") or "").lower() != "icloud":
+        return ""
+    address = str((retry_ctx or {}).get("email") or "").strip()
+    if not address:
+        return ""
+    try:
+        from .mail_providers.icloud import mark_code_timeout
+
+        mark_code_timeout(address)
         return address
     except Exception:  # noqa: BLE001
         return ""
@@ -4823,6 +4888,19 @@ class Registrator:
                         debug_wait=debug_wait,
                         debug_should_pause=lambda _error: True,
                     )
+                if PAGE_ERROR_ACCOUNT_EXISTS in str(error):
+                    # 终局：该原邮箱的别名空间已被 OpenAI 判定占用。换新别名重试只是
+                    # 重复烧浏览器会话，标记原邮箱耗尽并结束本轮，由批量协调器进下一轮。
+                    if gmail_order_mode:
+                        abort_gmail_retry(error, "遇到账号可能已存在")
+                        raise
+                    root = _mark_icloud_root_exhausted(retry_ctx)
+                    suffix = f"（root={root}，该邮箱后续别名全部跳过）" if root else ""
+                    emit_log(
+                        f"[worker] 账号可能已存在{suffix}，不换别名重试，直接进入下一轮: {error}",
+                        flush=True,
+                    )
+                    raise
                 raise
             except EmailDomainBlockedError as error:
                 # 第三层调整：临时邮箱域名被限流 → 等更久 + 换新邮箱
@@ -4835,12 +4913,19 @@ class Registrator:
                 await asyncio.sleep(wait_s)
                 continue
             except VerificationTimeoutError as error:
-                # 第三层调整：验证码超时 → 换新邮箱直接重试（可能邮件延迟）
+                # 第三层调整：验证码超时 → 换新邮箱直接重试（可能邮件延迟）。
+                # 同时把超时地址永久标记（单次即标）——不标的话 10 分钟分配窗
+                # 一过就复发，每复发一次白烧一个浏览器会话 + 3 分钟等码。
                 last_error = error
                 if gmail_order_mode:
                     abort_gmail_retry(error, "遇到验证码超时")
                     raise
-                emit_log(f"[worker] 验证码超时，换新邮箱重试 ({attempt + 1}/{max_retries})", flush=True)
+                timed_out = _mark_icloud_code_timeout(retry_ctx)
+                suffix = f"（{timed_out} 已标记，后续分配跳过）" if timed_out else ""
+                emit_log(
+                    f"[worker] 验证码超时{suffix}，换新邮箱重试 ({attempt + 1}/{max_retries})；原因: {last_error}",
+                    flush=True,
+                )
                 continue
             except WrongPhaseError as error:
                 # 第三层调整：页面阶段异常 → 换新邮箱重试
@@ -4858,31 +4943,6 @@ class Registrator:
                     raise
                 emit_log(f"[worker] 会话提取失败: {error} ({attempt + 1}/{max_retries})", flush=True)
                 continue
-            except OpenAIErrorPageError as error:
-                # OpenAI 应用错误页。其中「账号可能已存在」是终局：该主邮箱的
-                # 别名空间已被 OpenAI 判定占用，换新别名重试只是重复烧浏览器
-                # 会话（旧行为要重试到上限才在 registrations.py 标记 root）。
-                # 立即标记 root 耗尽并结束本轮，批量协调器直接进下一轮。
-                last_error = error
-                if PAGE_ERROR_ACCOUNT_EXISTS in str(error):
-                    if gmail_order_mode:
-                        abort_gmail_retry(error, "遇到账号可能已存在")
-                        raise
-                    root = _mark_icloud_root_exhausted(retry_ctx)
-                    suffix = f"（root={root}，该邮箱后续别名全部跳过）" if root else ""
-                    emit_log(
-                        f"[worker] 账号可能已存在{suffix}，不换别名重试，直接进入下一轮: {error}",
-                        flush=True,
-                    )
-                    raise
-                emit_log(f"[worker] OpenAI 错误页({error.stage}): {error}", flush=True)
-                if attempt < max_retries - 1:
-                    if gmail_order_mode:
-                        abort_gmail_retry(error, "遇到 OpenAI 错误页")
-                        raise
-                    emit_log(f"[worker] OpenAI 错误页，换新邮箱重试 ({attempt + 1}/{max_retries})", flush=True)
-                    continue
-                raise
             except RegisterError as error:
                 last_error = error
                 emit_log(f"[worker] 邮箱注册失败({error.stage}): {error}", flush=True)
@@ -5787,13 +5847,13 @@ class Registrator:
                 real_fp = await probe_runtime_fingerprint(page)
                 tz_pool = TIMEZONE_BY_REGION.get(region, []) if region else []
                 actual_tz = str(real_fp.get("timezone") or "")
-                mismatch_warn = ""
-                if actual_tz and tz_pool and actual_tz not in tz_pool:
-                    mismatch_warn = f" ⚠️ 时区与出口地区不一致(期望池={tz_pool})"
+                mismatch_warns = _fingerprint_mismatch_warnings(real_fp, env, tz_pool)
+                mismatch_warn = f" ⚠️ {'；'.join(mismatch_warns)}" if mismatch_warns else ""
                 if real_fp:
                     emit_log(
                         f"[env] 实际指纹: tz={actual_tz} viewport={real_fp.get('viewport')} "
                         f"dpr={real_fp.get('dpr')} screen={real_fp.get('screen')} "
+                        f"platform={real_fp.get('platform')} outer={real_fp.get('outer')} "
                         f"lang={real_fp.get('language')} languages={real_fp.get('languages')}"
                         f"{mismatch_warn}"
                     )
