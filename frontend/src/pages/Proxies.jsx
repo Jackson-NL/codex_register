@@ -5,7 +5,7 @@ import {
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import {
   Panel, Button, Badge, DataTable, SearchInput, Select, Input, Modal, Confirm, Drawer, Tabs,
-  Dropdown, IconBtn, Switch, useAsyncData, Empty,
+  Dropdown, IconBtn, Switch, useAsyncData, Empty, PageHeader,
 } from "../components/ui";
 import { useApp } from "../context/AppContext";
 import { api } from "../api";
@@ -143,16 +143,10 @@ export default function Proxies() {
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-[16px] font-semibold text-slate-800">代理池</h2>
-          <div className="mt-0.5 text-xs text-slate-400">{t(`出口代理管理与连通性监控 · 共 ${raw?.length || 0} 个`)}</div>
-        </div>
-        <div className="flex gap-2">
+      <PageHeader title="代理池" subtitle={t(`出口代理管理与连通性监控 · 共 ${raw?.length || 0} 个`)} extra={<>
           <Button variant="secondary" icon={<FileUp size={14} />} onClick={() => setBulkOpen(true)}>批量导入</Button>
           <Button icon={<Plus size={14} />} onClick={() => setAddOpen(true)}>新增代理</Button>
-        </div>
-      </div>
+        </>} />
 
       <Panel pad={false}>
         <div className="flex flex-wrap items-center gap-2 p-3">

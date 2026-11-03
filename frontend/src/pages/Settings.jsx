@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { Save, RotateCcw, CheckCircle2, XCircle, Loader2, ShieldCheck, Eye, EyeOff, RefreshCw } from "lucide-react";
 import {
-  Panel, Button, Input, Select, Switch, Badge, useAsyncData, Modal,
+  Panel, Button, Input, Select, Switch, Badge, useAsyncData, Modal, PageHeader,
 } from "../components/ui";
 import { useApp } from "../context/AppContext";
 import { api } from "../api";
@@ -260,13 +260,7 @@ export default function Settings() {
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-[16px] font-semibold text-slate-800">{t("系统设置")}</h2>
-          <div className="mt-0.5 text-xs text-slate-400">{t("实例级配置 · 修改保存后全局生效")}</div>
-        </div>
-        <Button variant="secondary" icon={<RotateCcw size={13} />} onClick={() => setConfirmReset(true)}>恢复默认值</Button>
-      </div>
+      <PageHeader title="系统设置" subtitle="实例级配置 · 修改保存后全局生效" extra={<Button variant="secondary" icon={<RotateCcw size={13} />} onClick={() => setConfirmReset(true)}>恢复默认值</Button>} />
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-4">
         {/* 分组导航 */}

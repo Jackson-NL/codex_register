@@ -9,11 +9,13 @@ from .config import settings
 from .db import init_db
 from .services.registrations import RegistrationService
 from .services.registrator import start_oauth_log_writer, stop_oauth_log_writer
-from .services.sub2api_relogin import Sub2APIReloginService
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from .api.account_relogin import SERVICE as relogin_service
+
+    await relogin_service.reset()
     init_db()
     # 清理上次进程残留的未完成任务（进程重启后后台任务已不存在）
     _cleanup_stale_registrations()
@@ -21,12 +23,8 @@ async def lifespan(app: FastAPI):
     service.start()
     # 注入到 registrations 路由模块
     from .api import registrations
-    from .api import sub2api_relogin
 
     registrations.SERVICE = service
-    sub2api_relogin.SERVICE = Sub2APIReloginService()
-    from .api import link_extraction
-    link_extraction.SERVICE = link_extraction.LinkExtractionService()
     # 初始化批量注册协调器
     init_batches(service)
     start_oauth_log_writer()
@@ -60,6 +58,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await relogin_service.shutdown()
         if rotator:
             await rotator.stop()
         if watchdog:
@@ -86,20 +85,6 @@ def _cleanup_stale_registrations():
             text(
                 "UPDATE batches SET status='canceled', finished_at=datetime('now') "
                 "WHERE status='running'"
-            )
-        )
-        conn.execute(
-            text(
-                "UPDATE sub2api_relogin_jobs SET status='failed', "
-                "error='服务重启中断（任务未完成）', finished_at=datetime('now') "
-                "WHERE status IN ('pending','running')"
-            )
-        )
-        conn.execute(
-            text(
-                "UPDATE link_extraction_jobs SET status='failed', "
-                "error='服务重启中断（任务未完成）', finished_at=datetime('now') "
-                "WHERE status IN ('pending','running')"
             )
         )
 

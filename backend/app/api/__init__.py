@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from . import accounts, admin, batches, gmail_sessions, link_extraction, mail_config, proxies, registrations, settings, stats, sub2api, sub2api_relogin, tasks
+from . import account_relogin, account_refresh, accounts, admin, batches, gmail_sessions, mail_config, mfa, proxies, registrations, settings, stats, sub2api, tasks
 
 api_router = APIRouter(prefix="/api")
 api_router.include_router(stats.router, tags=["stats"])
@@ -14,5 +14,6 @@ api_router.include_router(proxies.router, prefix="/proxies", tags=["proxies"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
 api_router.include_router(mail_config.router, prefix="/mail-config", tags=["mail-config"])
 api_router.include_router(sub2api.router, prefix="/sub2api", tags=["sub2api"])
-api_router.include_router(sub2api_relogin.router, prefix="/sub2api/relogin", tags=["sub2api-relogin"])
-api_router.include_router(link_extraction.router, prefix="/link-extraction", tags=["link-extraction"])
+api_router.include_router(account_relogin.router, prefix="/account-relogin", tags=["account-relogin"])
+api_router.include_router(account_refresh.router, prefix="/accounts", tags=["account-refresh"])
+api_router.include_router(mfa.router, prefix="/mfa", tags=["mfa"])

@@ -1,0 +1,235 @@
+/* Scoped workbench styling. The shared application shell is unchanged. */
+.relogin-workspace {
+  --rl-bg: #f1f5f3;
+  --rl-surface: #ffffff;
+  --rl-soft: #f7f9f8;
+  --rl-line: #dfe7e2;
+  --rl-ink: #253b32;
+  --rl-muted: #62786c;
+  --rl-accent: #24785c;
+  --rl-accent-hover: #1b6049;
+  --rl-tint: #edf6f1;
+  --rl-accent-line: #a6cdbb;
+  --rl-warning: #98601c;
+  --rl-danger: #b43b43;
+  min-height: calc(100dvh - 164px);
+  margin: 0;
+  padding: 0;
+  color: var(--rl-ink);
+  background: transparent;
+}
+
+.relogin-workspace *,
+.relogin-workspace *::before,
+.relogin-workspace *::after { box-sizing: border-box; }
+
+.relogin-page-head,
+.relogin-card-head,
+.relogin-heading-group,
+.relogin-result-actions,
+.relogin-page-state,
+.relogin-result-context,
+.relogin-input-footer,
+.relogin-results-footer,
+.relogin-results-footer > span:last-child,
+.relogin-input-footer > span,
+.relogin-save-state { display: flex; align-items: center; }
+
+.relogin-page-head { justify-content: space-between; gap: 20px; margin-bottom: 22px; }
+.relogin-eyebrow { margin: 0 0 4px; color: var(--rl-accent); font-size: 10px; font-weight: 700; letter-spacing: .1em; line-height: 1.4; }
+.relogin-page-head h1 { margin: 0; font-size: 25px; font-weight: 700; letter-spacing: -.04em; line-height: 1.4; }
+.relogin-description { margin: 5px 0 0; color: var(--rl-muted); font-size: 12px; line-height: 1.6; }
+.relogin-page-state { flex-shrink: 0; gap: 7px; color: var(--rl-muted); font-size: 12px; }
+.relogin-live-dot { display: inline-block; height: 6px; width: 6px; flex-shrink: 0; border-radius: 50%; background: var(--rl-accent); box-shadow: 0 0 0 3px var(--rl-tint); }
+.relogin-live-dot.is-active { animation: relogin-pulse 1.6s ease-in-out infinite; }
+
+.relogin-grid { display: grid; grid-template-columns: minmax(320px, 0.36fr) minmax(0, 0.64fr); align-items: stretch; gap: 20px; min-height: calc(100dvh - 246px); }
+.relogin-card { display: flex; min-width: 0; flex-direction: column; border: 1px solid var(--rl-line); border-radius: 10px; background: var(--rl-surface); box-shadow: 0 1px 2px #1e4d3510; }
+.relogin-card-head { min-height: 76px; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--rl-line); padding: 17px 20px; }
+.relogin-card-head h2 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.02em; line-height: 1.5; }
+.relogin-card-head .relogin-eyebrow { font-size: 9px; }
+.relogin-heading-group { gap: 11px; }
+.relogin-section-icon { display: grid; width: 36px; height: 36px; flex-shrink: 0; place-items: center; border: 1px solid var(--rl-line); border-radius: 8px; color: var(--rl-accent); background: var(--rl-tint); }
+.relogin-small-tag { white-space: nowrap; border: 1px solid var(--rl-line); border-radius: 4px; padding: 3px 7px; color: var(--rl-muted); background: var(--rl-soft); font-size: 10px; }
+
+.relogin-input-body { display: flex; flex: 1; flex-direction: column; gap: 18px; padding: 20px; }
+.relogin-mode-switch { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.relogin-mode-switch button { display: flex; min-width: 0; min-height: 66px; align-items: center; gap: 9px; border: 1px solid var(--rl-line); border-radius: 6px; padding: 11px; text-align: left; color: var(--rl-muted); background: var(--rl-soft); transition: border-color 150ms, background-color 150ms; }
+.relogin-mode-switch button.is-selected { border-color: var(--rl-accent-line); color: var(--rl-accent); background: var(--rl-tint); box-shadow: inset 0 0 0 1px var(--rl-accent-line); }
+.relogin-mode-switch button svg { flex-shrink: 0; }
+.relogin-mode-label { display: block; font-size: 12px; font-weight: 650; }
+.relogin-mode-hint { display: block; margin-top: 4px; color: var(--rl-muted); font-size: 10px; }
+.relogin-mode-switch button:disabled { opacity: .6; }
+.relogin-credential-fields { display: flex; flex-direction: column; gap: 17px; }
+.relogin-workspace .input { min-height: 40px; border-color: var(--rl-line); border-radius: 5px; color: var(--rl-ink); background: var(--rl-surface); font-size: 13px; }
+.relogin-workspace .input::placeholder { color: var(--rl-muted); opacity: .7; }
+.relogin-workspace .input:focus { border-color: var(--rl-accent); box-shadow: 0 0 0 3px var(--rl-tint); }
+.relogin-workspace .input:disabled { opacity: .6; }
+.relogin-workspace label > span:first-child { color: var(--rl-muted); }
+.relogin-workspace label > span:last-child { line-height: 1.6; }
+.relogin-field-note { margin: 0; color: var(--rl-muted); font-size: 11px; line-height: 1.7; }
+.relogin-batch-label > span { display: block; margin-bottom: 7px; font-size: 12px; font-weight: 500; }
+.relogin-workspace .relogin-batch-input { display: block; min-height: 224px; resize: vertical; padding: 13px; font-family: var(--font-mono); font-size: 12px; line-height: 1.9; }
+.relogin-show-input { display: flex; align-items: center; gap: 8px; color: var(--rl-muted); font-size: 12px; }
+.relogin-show-input input { accent-color: var(--rl-accent); }
+.relogin-advanced { border: 1px solid var(--rl-line); border-radius: 6px; background: var(--rl-soft); }
+.relogin-advanced summary,
+.relogin-log-panel summary,
+.relogin-history-panel summary { display: flex; min-height: 44px; align-items: center; justify-content: space-between; gap: 12px; list-style: none; cursor: pointer; color: var(--rl-muted); font-size: 12px; }
+.relogin-workspace summary::-webkit-details-marker { display: none; }
+.relogin-workspace summary > span { display: inline-flex; align-items: center; gap: 7px; }
+.relogin-advanced summary { padding: 0 12px; }
+.relogin-summary-meta { color: var(--rl-muted); font-size: 10px; }
+.relogin-workspace summary .relogin-summary-meta svg { transition: transform 150ms; }
+.relogin-workspace details[open] > summary .relogin-summary-meta svg { transform: rotate(180deg); }
+.relogin-advanced-fields { display: grid; gap: 14px; border-top: 1px solid var(--rl-line); padding: 14px 12px; }
+.relogin-protocol-note { display: flex; align-items: flex-start; gap: 9px; margin-top: auto; border: 1px dashed var(--rl-accent-line); border-radius: 6px; padding: 12px; color: var(--rl-accent); background: var(--rl-tint); }
+.relogin-protocol-note > svg { flex-shrink: 0; margin-top: 1px; }
+.relogin-protocol-note strong { font-size: 12px; font-weight: 600; }
+.relogin-protocol-note p { margin: 4px 0 0; color: var(--rl-muted); font-size: 11px; line-height: 1.8; }
+
+.relogin-submit-bar { position: sticky; bottom: -16px; z-index: 2; margin-top: auto; border-top: 1px solid var(--rl-line); border-radius: 0 0 10px 10px; padding: 16px 20px 0; background: var(--rl-surface); }
+.relogin-execution-mode { display: flex; align-items: center; gap: 12px; margin-bottom: 9px; }
+.relogin-execution-mode label { color: var(--rl-muted); font-size: 12px; }
+.relogin-execution-mode select { min-width: 0; min-height: 36px; flex: 1; border: 1px solid var(--rl-line); border-radius: 5px; padding: 5px 9px; color: var(--rl-ink); background: var(--rl-soft); font-size: 12px; }
+.relogin-submit-actions { display: flex; align-items: stretch; gap: 8px; margin-top: 13px; }
+.relogin-submit-actions .relogin-start { min-height: 40px; flex: 1; border: 1px solid transparent; background-color: var(--rl-accent); color: #fff; }
+.relogin-submit-actions .relogin-start:not(:disabled):hover { background-color: var(--rl-accent-hover); }
+.relogin-submit-actions .relogin-start[data-variant="destructive"] { background-color: var(--rl-danger); color: #fff; }
+.relogin-clear { border: 1px solid var(--rl-line); border-radius: 5px; padding: 0 12px; color: var(--rl-muted); background: var(--rl-surface); font-size: 12px; }
+.relogin-clear:disabled { opacity: .45; }
+.relogin-input-footer { min-height: 42px; justify-content: space-between; gap: 8px; color: var(--rl-muted); font-size: 10px; }
+.relogin-input-footer > span { gap: 5px; }
+.relogin-input-footer > span:first-child { color: var(--rl-accent); }
+
+.relogin-result-actions { flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.relogin-workspace .relogin-result-actions .btn,
+.relogin-workspace .relogin-row-actions .btn { min-height: 32px; border-color: var(--rl-line); color: var(--rl-muted); background: var(--rl-surface); }
+.relogin-workspace .relogin-result-actions .btn:hover,
+.relogin-workspace .relogin-row-actions .btn:not(:disabled):hover { color: var(--rl-accent); background: var(--rl-tint); }
+.relogin-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0; margin: 20px 20px 0; border: 1px solid var(--rl-line); border-radius: 6px; background: var(--rl-soft); }
+.relogin-metric { position: relative; display: flex; flex-direction: column; gap: 7px; padding: 14px 18px; }
+.relogin-metric + .relogin-metric::before { position: absolute; top: 17px; bottom: 17px; left: 0; width: 1px; background: var(--rl-line); content: ""; }
+.relogin-metric > span { color: var(--rl-muted); font-size: 11px; white-space: nowrap; }
+.relogin-metric strong { color: var(--rl-ink); font-size: 26px; font-weight: 550; font-variant-numeric: tabular-nums; letter-spacing: -.04em; line-height: 1; }
+.relogin-metric.success strong { color: var(--rl-accent); }
+.relogin-result-context { min-height: 58px; justify-content: space-between; gap: 12px; padding: 12px 20px; color: var(--rl-muted); font-size: 11px; }
+.relogin-result-context strong { margin-left: 5px; color: var(--rl-ink); font-weight: 550; font-variant-numeric: tabular-nums; }
+.relogin-context-divider { margin: 0 9px; opacity: .5; }
+.relogin-result-table-wrap { display: flex; min-width: 0; flex: 1; flex-direction: column; overflow: auto; }
+.relogin-result-table { width: 100%; min-width: 610px; border-collapse: collapse; text-align: left; font-size: 12px; }
+.relogin-result-table thead { border-top: 1px solid var(--rl-line); border-bottom: 1px solid var(--rl-line); background: var(--rl-soft); }
+.relogin-result-table th { padding: 10px 16px; color: var(--rl-muted); font-size: 10px; font-weight: 500; white-space: nowrap; }
+.relogin-result-table td { border-bottom: 1px solid var(--rl-line); padding: 16px; vertical-align: top; }
+.relogin-result-table td:first-child { width: 37%; max-width: 320px; }
+.relogin-result-table td:nth-child(2) { min-width: 110px; }
+.relogin-result-table td:nth-child(3) { min-width: 112px; }
+.relogin-result-table td:last-child { min-width: 130px; }
+.relogin-account-email { overflow-wrap: anywhere; color: var(--rl-ink); font-weight: 550; line-height: 1.6; }
+.relogin-account-stage { margin-top: 5px; color: var(--rl-muted); font-size: 10px; line-height: 1.6; }
+.relogin-row-warning,
+.relogin-row-error { margin: 7px 0 0; overflow-wrap: anywhere; font-size: 11px; line-height: 1.7; }
+.relogin-row-warning { color: var(--rl-warning); }
+.relogin-row-error { color: var(--rl-danger); }
+.relogin-token-badges,
+.relogin-row-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+.relogin-save-state { gap: 4px; margin-top: 8px; color: var(--rl-accent); font-size: 10px; }
+.relogin-save-state > span { opacity: .8; }
+.relogin-empty-state { display: flex; min-height: 300px; flex: 1; flex-direction: column; align-items: center; justify-content: center; padding: 32px 20px 48px; text-align: center; }
+.relogin-empty-icon { display: grid; width: 60px; height: 60px; place-items: center; margin-bottom: 17px; border: 1px solid var(--rl-line); border-radius: 16px; color: #8caa9a; background: var(--rl-soft); }
+.relogin-empty-state h3 { margin: 0; color: var(--rl-muted); font-size: 13px; font-weight: 500; }
+.relogin-empty-state p { margin: 7px 0 0; color: var(--rl-muted); font-size: 11px; line-height: 1.7; }
+.relogin-empty-flow { display: flex; align-items: center; gap: 10px; margin-top: 24px; color: var(--rl-muted); font-size: 10px; opacity: .85; }
+
+.relogin-log-panel,
+.relogin-history-panel { border-top: 1px solid var(--rl-line); }
+.relogin-log-panel summary,
+.relogin-history-panel summary { padding: 0 18px; }
+.relogin-summary-count { border-radius: 3px; padding: 1px 5px; color: var(--rl-muted); background: var(--rl-soft); font-size: 10px; font-variant-numeric: tabular-nums; }
+.relogin-log-content { max-height: 216px; min-height: 88px; overflow: auto; border-top: 1px solid var(--rl-line); padding: 13px 18px; color: var(--rl-muted); background: var(--rl-soft); font-family: var(--font-mono); font-size: 11px; line-height: 2; }
+.relogin-log-content > div { overflow-wrap: anywhere; }
+.relogin-log-content time { margin-right: 12px; opacity: .7; }
+.relogin-history-list { max-height: 220px; overflow: auto; border-top: 1px solid var(--rl-line); padding: 6px 12px; }
+.relogin-history-list > button { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 10px; border-radius: 5px; padding: 9px; text-align: left; }
+.relogin-history-list > button:hover,
+.relogin-history-list > button.is-selected { background: var(--rl-tint); }
+.relogin-history-list > button > span:first-child { display: flex; align-items: center; gap: 14px; font-size: 11px; }
+.relogin-history-list strong { font-weight: 550; }
+.relogin-history-list > button > span:first-child > span,
+.relogin-history-list > p { color: var(--rl-muted); font-size: 10px; }
+.relogin-history-list > p { padding: 10px 8px; }
+.relogin-results-footer { min-height: 42px; justify-content: space-between; gap: 10px; border-top: 1px solid var(--rl-line); border-radius: 0 0 10px 10px; padding: 10px 18px; color: var(--rl-muted); background: var(--rl-soft); font-size: 10px; }
+.relogin-results-footer > span:last-child { gap: 7px; }
+.relogin-error,
+.relogin-validation { border: 1px solid #e6b6ba; border-radius: 6px; padding: 10px 13px; color: var(--rl-danger); background: var(--rl-surface); font-size: 12px; line-height: 1.7; }
+.relogin-error { margin-bottom: 16px; }
+.relogin-workspace button:focus-visible,
+.relogin-workspace summary:focus-visible,
+.relogin-workspace select:focus-visible { outline: 2px solid var(--rl-accent); outline-offset: 3px; }
+
+html.theme-dark .relogin-workspace {
+  --rl-bg: #101a17;
+  --rl-surface: #17251f;
+  --rl-soft: #1b2c24;
+  --rl-line: #30463a;
+  --rl-ink: #e3ede7;
+  --rl-muted: #a1b6a9;
+  --rl-accent: #78c4a3;
+  --rl-accent-hover: #226147;
+  --rl-tint: #203e30;
+  --rl-accent-line: #487e61;
+  --rl-warning: #e5bc7d;
+  --rl-danger: #f0939a;
+}
+html.theme-dark .relogin-workspace .input,
+html.theme-dark .relogin-workspace select,
+html.theme-dark .relogin-workspace option { color: var(--rl-ink); background: var(--rl-surface); }
+html.theme-dark .relogin-workspace .relogin-result-actions .btn,
+html.theme-dark .relogin-workspace .relogin-row-actions .btn { background-color: var(--rl-surface) !important; }
+html.theme-dark .relogin-workspace .relogin-start:not([data-variant="destructive"]) { color: #10251a; }
+html.theme-dark .relogin-workspace .relogin-start:not([data-variant="destructive"]):not(:disabled):hover { color: #fff; }
+
+@media (max-width: 1179px) {
+  .relogin-grid { grid-template-columns: minmax(0, 1fr); min-height: 0; }
+  .relogin-input-body { gap: 16px; }
+  .relogin-credential-fields { display: grid; grid-template-columns: 1fr 1fr; }
+  .relogin-credential-fields > :last-child { grid-column: 1 / -1; }
+  .relogin-credential-fields:has(.relogin-batch-input) { display: flex; }
+  .relogin-protocol-note { margin-top: 0; }
+  .relogin-submit-bar { position: static; }
+  .relogin-results-card { min-height: 610px; }
+}
+
+@media (max-width: 639px) {
+  .relogin-workspace { padding: 0; }
+  .relogin-page-head { align-items: flex-start; gap: 10px; margin-bottom: 18px; }
+  .relogin-page-head h1 { font-size: 23px; }
+  .relogin-page-state { margin-top: 5px; font-size: 10px; white-space: nowrap; }
+  .relogin-description { max-width: 240px; font-size: 11px; }
+  .relogin-card-head { min-height: 70px; padding: 15px; }
+  .relogin-card-head h2 { font-size: 15px; }
+  .relogin-input-body { padding: 16px; }
+  .relogin-credential-fields { display: flex; }
+  .relogin-mode-switch button { min-height: 66px; gap: 8px; padding: 10px; }
+  .relogin-mode-hint { font-size: 9px; }
+  .relogin-submit-bar { padding: 14px 16px 0; }
+  .relogin-workspace .input { min-height: 44px; font-size: 16px; }
+  .relogin-workspace .relogin-batch-input { font-size: 13px; }
+  .relogin-workspace button.btn,
+  .relogin-clear,
+  .relogin-execution-mode select { min-height: 44px; }
+  .relogin-metrics { margin: 16px 14px 0; }
+  .relogin-metric { padding: 13px 10px; }
+  .relogin-metric > span { font-size: 10px; }
+  .relogin-metric strong { font-size: 23px; }
+  .relogin-result-context { padding: 12px 14px; }
+  .relogin-result-actions { gap: 4px; }
+  .relogin-workspace .relogin-result-actions .btn { gap: 4px; padding: 5px 7px; font-size: 11px; }
+  .relogin-empty-state { min-height: 310px; }
+  .relogin-history-list > button > span:first-child { align-items: flex-start; flex-direction: column; gap: 3px; }
+}
+
+@keyframes relogin-pulse { 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) {
+  .relogin-workspace *, .relogin-workspace *::before, .relogin-workspace *::after { animation: none !important; transition: none !important; }
+}

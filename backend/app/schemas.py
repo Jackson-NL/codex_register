@@ -1,6 +1,5 @@
 from datetime import datetime
 from enum import Enum
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
@@ -128,92 +127,6 @@ class BatchOut(OrmModel):
     created_at: datetime
     finished_at: datetime | None = None
     registrations: list[RegistrationOut] = []
-
-
-class Sub2APIReloginPreviewOut(BaseModel):
-    group_ids: list[int]
-    remote_total: int
-    error_total: int
-    matched_local: int
-    missing_local: int
-    runnable: int
-    items: list[dict]
-
-
-class Sub2APIReloginCreate(BaseModel):
-    group_ids: list[int] = Field(min_length=1)
-    only_error: bool = True
-    headless: bool = True
-    concurrency: int = Field(default=3, ge=1, le=5)
-    fresh_profile: bool = False
-    browser_proxy: str = ""
-    timeout_s: int = Field(default=160, ge=10, le=900)
-    retry_reauth_url: int = Field(default=2, ge=1, le=3)
-    delete_deactivated: bool = False
-    preview_items: list[dict] = Field(default_factory=list)
-
-
-class Sub2APIReloginJobOut(OrmModel):
-    id: int
-    status: str
-    group_ids: str
-    headless: bool
-    concurrency: int
-    only_error: bool
-    total: int
-    pending: int
-    success: int
-    failed: int
-    skipped: int
-    error: str
-    created_at: datetime
-    finished_at: datetime | None = None
-
-
-class LinkExtractionCreate(BaseModel):
-    account_ids: list[int] = Field(min_length=1)
-    checkout_proxy: str = ""
-    update_proxy: str = ""
-    country: str = "GB"
-    payment_method: Literal["paypal", "gopay", "gcash"] = "paypal"
-    apply_checkout_update: bool = True
-    oaics_only: bool = False
-    concurrency: int = Field(default=2, ge=1, le=5)
-    max_attempts: int = Field(default=6, ge=1, le=20)
-    rotate_proxy: bool = True
-    browser_fallback: bool = True
-    require_zero_amount: bool = False
-    checkout_region: str = ""
-    update_region: str = ""
-    promo_campaign_id: str = ""
-
-
-class LinkExtractionJobOut(OrmModel):
-    id: int
-    status: str
-    total: int
-    pending: int
-    running: int
-    succeeded: int
-    failed: int
-    canceled: int
-    concurrency: int
-    country: str
-    payment_method: str
-    apply_checkout_update: bool
-    oaics_only: bool
-    error: str
-    created_at: datetime
-    started_at: datetime | None = None
-    finished_at: datetime | None = None
-
-
-class LinkExtractionAccountsOut(BaseModel):
-    items: list[dict]
-    total: int
-    page: int
-    page_size: int
-    pages: int
 
 
 class Sub2APIUploadStatusOut(OrmModel):

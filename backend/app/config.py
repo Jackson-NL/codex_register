@@ -120,9 +120,6 @@ class Settings(BaseSettings):
     # Sub2API 部署侧按出口 IP 地区做准入（REGION_NOT_SUPPORTED → HTTP 403），
     # 本机直连会被拒。留空时回退 default_proxy；填 direct/none 强制直连。
     sub2api_proxy: str = ""
-    # 留空时使用 SUB2API_BASE_URL/auth/callback；Sub2API 生成重登链接时使用该远端回调，
-    # 因此本地浏览器不需要监听 OAuth callback 端口。
-    sub2api_reauth_redirect_uri: str = ""
 
     # ---------- 管理员入口 ----------
     # 只从 backend/.env 或运行环境读取，不回传到前端。

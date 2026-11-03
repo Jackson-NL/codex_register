@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
-  Users, UserCheck, Activity, KeyRound, Mail,
+  Users, UserCheck, Activity, KeyRound, Mail, ArrowUpRight, Plus, CalendarDays,
 } from "lucide-react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, BarChart, Bar,
@@ -11,7 +11,7 @@ import { useApp } from "../context/AppContext";
 import { api } from "../api";
 import { fmtTime, fmtAgo } from "../mock/data";
 
-const PIE_COLORS = { active: "#16a34a", cooling: "#ea580c", unhealthy: "#dc2626", paused: "#94a3b8", unknown: "#94a3b8" };
+const PIE_COLORS = { active: "#208d72", cooling: "#d3a655", unhealthy: "#d76e73", paused: "#899b9c", unknown: "#a2adaf" };
 const TASK_BADGE = {
   success: ["success", "已完成"],
   failed: ["danger", "失败"],
@@ -129,6 +129,10 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-4">
+      <div className="ops-dashboard-intro">
+        <div><div className="ops-dashboard-kicker"><span className="ops-status-dot" /> WORKSPACE OVERVIEW</div><h1>{t("工作空间概览")}</h1><p>{t("从账号状态到任务进展，所有关键动态尽在掌握。")}</p></div>
+        <div><div className="ops-dashboard-actions"><Button variant="secondary" icon={<Users size={15} />} onClick={() => navigate("/accounts")}>账号管理</Button><Button icon={<Plus size={15} />} onClick={() => navigate("/register")}>新建注册任务</Button></div><div className="ops-dashboard-date"><CalendarDays size={12} className="mr-1.5 inline" />{new Date().toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric", weekday: "short" })}</div></div>
+      </div>
       {/* 指标 */}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard label="可用账号" value={statMetrics ? statMetrics.available : "—"} sub="active 状态"
@@ -152,18 +156,18 @@ export default function Dashboard() {
                 <XAxis dataKey="date" tick={{ fontSize: 11, fill: "#9aa3b2" }} axisLine={false} tickLine={false} />
                 <YAxis tick={{ fontSize: 11, fill: "#9aa3b2" }} axisLine={false} tickLine={false} allowDecimals={false} />
                 <Tooltip contentStyle={{ fontSize: 12, borderRadius: 6, border: "1px solid #e5e8ee" }} />
-                <Line type="monotone" dataKey="success" name={t("成功")} stroke="#16a34a" strokeWidth={2} dot={false} />
-                <Line type="monotone" dataKey="failed" name={t("失败")} stroke="#dc2626" strokeWidth={2} dot={false} />
+                <Line isAnimationActive={false} type="monotone" dataKey="success" name={t("成功")} stroke="#208d72" strokeWidth={2} dot={false} />
+                <Line isAnimationActive={false} type="monotone" dataKey="failed" name={t("失败")} stroke="#d76e73" strokeWidth={2} dot={false} />
               </LineChart>
             </ResponsiveContainer>
           </div>
         </Panel>
         <Panel title="账号健康状态分布"
-          extra={<Button variant="ghost" size="sm" onClick={() => gotoWithFilter("/accounts", {})}>查看全部 →</Button>}>
+          extra={<Button variant="ghost" size="sm" onClick={() => gotoWithFilter("/accounts", {})}>查看全部<ArrowUpRight size={13} /></Button>}>
           <div className="relative h-44">
             <ResponsiveContainer width="100%" height="100%">
               <PieChart>
-                <Pie data={healthDist} dataKey="value" nameKey="name" innerRadius={48} outerRadius={68} paddingAngle={2}
+                <Pie isAnimationActive={false} data={healthDist} dataKey="value" nameKey="name" innerRadius={48} outerRadius={68} paddingAngle={2} stroke="var(--panel)"
                   onClick={(e) => gotoWithFilter("/accounts", { health: e.key })} style={{ cursor: "pointer" }}>
                   {healthDist.map((e) => <Cell key={e.key} fill={PIE_COLORS[e.key] || "#94a3b8"} />)}
                 </Pie>
@@ -198,7 +202,7 @@ export default function Dashboard() {
                   <XAxis type="number" tick={{ fontSize: 11, fill: "#9aa3b2" }} axisLine={false} tickLine={false} allowDecimals={false} />
                   <YAxis type="category" dataKey="name" width={90} tick={{ fontSize: 11, fill: "#5b6472" }} axisLine={false} tickLine={false} />
                   <Tooltip contentStyle={{ fontSize: 12, borderRadius: 6, border: "1px solid #e5e8ee" }} />
-                  <Bar dataKey="value" name="次数" fill="#dc2626" radius={[0, 4, 4, 0]} barSize={14} />
+                  <Bar isAnimationActive={false} dataKey="value" name="次数" fill="#d76e73" radius={[0, 4, 4, 0]} barSize={14} />
                 </BarChart>
               </ResponsiveContainer>
             </div>

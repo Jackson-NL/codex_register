@@ -252,52 +252,6 @@ def _migrate_legacy_tables(target_engine=None):
                 )
             )
 
-    # Sub2API 重登表在旧数据库中不存在时由 create_all 创建；若运行中的旧库
-    # 已经提前创建了部分字段，则用 SQLite 兼容的 ADD COLUMN 补齐，不删除历史任务。
-    Base.metadata.create_all(bind=engine)
-    inspector = inspect(engine)
-    relogin_columns = {
-        "sub2api_relogin_jobs": {
-            "status": "VARCHAR(16) DEFAULT 'pending'",
-            "group_ids": "TEXT DEFAULT ''",
-            "headless": "BOOLEAN DEFAULT 1",
-            "concurrency": "INTEGER DEFAULT 3",
-            "only_error": "BOOLEAN DEFAULT 1",
-            "total": "INTEGER DEFAULT 0",
-            "pending": "INTEGER DEFAULT 0",
-            "success": "INTEGER DEFAULT 0",
-            "failed": "INTEGER DEFAULT 0",
-            "skipped": "INTEGER DEFAULT 0",
-            "error": "TEXT DEFAULT ''",
-            "logs_json": "TEXT DEFAULT '[]'",
-            "config_json": "TEXT DEFAULT '{}'",
-            "created_at": "DATETIME",
-            "finished_at": "DATETIME",
-        },
-        "sub2api_relogin_items": {
-            "job_id": "INTEGER",
-            "remote_account_id": "VARCHAR(128) DEFAULT ''",
-            "proxy_id": "INTEGER",
-            "local_account_id": "INTEGER",
-            "email": "VARCHAR(128) DEFAULT ''",
-            "remote_status": "VARCHAR(64) DEFAULT ''",
-            "remote_error": "TEXT DEFAULT ''",
-            "status": "VARCHAR(16) DEFAULT 'pending'",
-            "reason": "VARCHAR(64) DEFAULT ''",
-            "error": "TEXT DEFAULT ''",
-            "reauth_endpoint": "VARCHAR(256) DEFAULT ''",
-            "callback_endpoint": "VARCHAR(256) DEFAULT ''",
-            "started_at": "DATETIME",
-            "finished_at": "DATETIME",
-        },
-    }
-    with engine.begin() as conn:
-        for table_name, columns in relogin_columns.items():
-            existing = {column["name"] for column in inspector.get_columns(table_name)} if table_name in inspector.get_table_names() else set()
-            for column_name, column_type in columns.items():
-                if column_name not in existing:
-                    conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"))
-
     # ---------- account_sub2api_uploads（Sub2API 上传状态，按 account+group 唯一） ----------
     uploads_columns = {
         "account_id": "INTEGER REFERENCES accounts(id)",

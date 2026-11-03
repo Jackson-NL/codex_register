@@ -2,7 +2,7 @@
 param(
     [switch]$NoRestart,
     [int]$BackendPort = 8000,
-    [int]$FrontendPort = 5173
+    [int]$FrontendPort = 5180
 )
 
 $ErrorActionPreference = "Stop"
@@ -83,7 +83,7 @@ if (-not (Get-ListeningProcessIds $BackendPort).Count) {
 
 if (-not (Get-ListeningProcessIds $FrontendPort).Count) {
     $frontend = Start-Process -FilePath "cmd.exe" `
-        -ArgumentList "/d", "/s", "/c", "npm run dev -- --host 127.0.0.1 --port $FrontendPort" `
+        -ArgumentList "/d", "/s", "/c", "npm run dev -- --host 127.0.0.1 --port $FrontendPort --strictPort" `
         -WorkingDirectory $FrontendDir -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput $frontendLog -RedirectStandardError $frontendErrorLog
     Write-Host "Frontend started (launcher PID $($frontend.Id))."

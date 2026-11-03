@@ -72,6 +72,15 @@ export const api = {
     get: () => GET("/stats"),
   },
 
+  accountRelogin: {
+    createJob: (body) => POST("/account-relogin/jobs", body, { cache: "no-store" }),
+    jobs: () => request("/account-relogin/jobs", { cache: "no-store" }),
+    job: (id) => request(`/account-relogin/jobs/${encodeURIComponent(id)}`, { cache: "no-store" }),
+    cancel: (id) => POST(`/account-relogin/jobs/${encodeURIComponent(id)}/cancel`, {}, { cache: "no-store" }),
+    credentials: (id, itemId) => POST(`/account-relogin/jobs/${encodeURIComponent(id)}/items/${encodeURIComponent(itemId)}/credentials`, {}, { cache: "no-store" }),
+    save: (id, itemId) => POST(`/account-relogin/jobs/${encodeURIComponent(id)}/items/${encodeURIComponent(itemId)}/save`, {}, { cache: "no-store" }),
+  },
+
   accounts: {
     list: (params = {}) => {
       const qs = new URLSearchParams();
@@ -99,6 +108,17 @@ export const api = {
     del: (id) => DEL(`/accounts/${id}`),
     patch: (id, body) => PATCH(`/accounts/${id}`, body),
     writeTotp: (id, secret) => PATCH(`/accounts/${id}/totp`, { secret }),
+    // ---------- 账号信息刷新（远端身份/额度/凭据续期，与「刷新列表」区分） ----------
+    refreshSingle: (id) =>
+      POST("/accounts/refresh/single", { account_ids: [id], scope: "selected" }, { cache: "no-store" }),
+    refreshStart: (accountIds, scope = "selected") =>
+      POST("/accounts/refresh/jobs", { account_ids: accountIds, scope }, { cache: "no-store" }),
+    refreshJob: (jobId) =>
+      request(`/accounts/refresh/jobs/${encodeURIComponent(jobId)}`, { cache: "no-store" }),
+    refreshJobActive: () =>
+      request("/accounts/refresh/jobs/active", { cache: "no-store" }),
+    refreshCancel: (jobId) =>
+      POST(`/accounts/refresh/jobs/${encodeURIComponent(jobId)}/cancel`, {}, { cache: "no-store" }),
   },
 
   sub2api: {
@@ -117,39 +137,6 @@ export const api = {
       qs.set("page_size", String(params.pageSize || 20));
       return GET(`/sub2api/upload-status?${qs.toString()}`);
     },
-  },
-
-  sub2apiRelogin: {
-    preview: ({ group_ids = [], only_error = true } = {}) => {
-      const ids = (Array.isArray(group_ids) ? group_ids : String(group_ids).split(/[,，\s]+/))
-        .map(Number)
-        .filter((id) => Number.isInteger(id) && id > 0);
-      const qs = new URLSearchParams({ group_ids: ids.join(","), only_error: String(Boolean(only_error)) });
-      return GET(`/sub2api/relogin/preview?${qs.toString()}`);
-    },
-    createJob: (body) => POST("/sub2api/relogin/jobs", body),
-    jobs: () => GET("/sub2api/relogin/jobs"),
-    job: (id) => GET(`/sub2api/relogin/jobs/${id}`),
-    items: (id) => GET(`/sub2api/relogin/jobs/${id}/items`),
-    logs: (id, after = 0) => GET(`/sub2api/relogin/jobs/${id}/logs?after=${encodeURIComponent(after)}`),
-    cancel: (id) => POST(`/sub2api/relogin/jobs/${id}/cancel`),
-  },
-
-  linkExtraction: {
-    accounts: (params = {}) => {
-      const qs = new URLSearchParams();
-      if (params.q) qs.set("q", params.q);
-      qs.set("has_token", String(params.hasToken !== false));
-      qs.set("page", String(params.page || 1));
-      qs.set("page_size", String(params.pageSize || 50));
-      return GET(`/link-extraction/accounts?${qs.toString()}`);
-    },
-    createJob: (body) => POST("/link-extraction/jobs", body),
-    jobs: () => GET("/link-extraction/jobs"),
-    job: (id) => GET(`/link-extraction/jobs/${id}`),
-    items: (id) => GET(`/link-extraction/jobs/${id}/items`),
-    logs: (id, after = 0) => GET(`/link-extraction/jobs/${id}/logs?after=${encodeURIComponent(after)}`),
-    cancel: (id) => POST(`/link-extraction/jobs/${id}/cancel`),
   },
 
   registrations: {

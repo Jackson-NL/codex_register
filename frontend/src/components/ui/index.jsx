@@ -1,6 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { forwardRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp, ChevronsUpDown, Search, X, Loader2, Inbox, AlertTriangle, RefreshCw, Eye, EyeOff, Copy, Check, ShieldAlert, XCircle } from "lucide-react";
 import { useApp } from "../../context/AppContext";
+import { Button as PrimitiveButton } from "./button";
+import { Card, CardContent, CardHeader } from "./card";
+import { Input as PrimitiveInput } from "./input";
+import { Dialog, DialogContent, DialogTitle } from "./dialog";
+import { Sheet, SheetContent, SheetTitle } from "./sheet";
+import { Switch as PrimitiveSwitch } from "./switch";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "./dropdown-menu";
+import { cn } from "../../lib/utils";
 
 function translateNode(node, t) {
   if (typeof node === "string") return t(node);
@@ -8,36 +16,38 @@ function translateNode(node, t) {
   return node;
 }
 
-// ---------------- 基础 ---------------- //
-export function Button({ children, onClick, variant = "primary", size = "md", icon, disabled, loading, className = "", type = "button", title }) {
-  const { t } = useApp();
-  const v = {
-    primary: "bg-blue-600 text-white hover:bg-blue-700",
-    secondary: "bg-white text-slate-700 border border-slate-300 hover:bg-slate-50",
-    ghost: "text-slate-600 hover:bg-slate-100",
-    danger: "bg-red-600 text-white hover:bg-red-700",
-    dangerSoft: "text-red-600 border border-red-200 hover:bg-red-50",
-    success: "bg-emerald-600 text-white hover:bg-emerald-700",
-  }[variant];
-  const s = { sm: "px-2 py-1 text-xs", md: "px-3 py-1.5 text-[13px]", lg: "px-4 py-2 text-sm" }[size];
-  return (
-    <button type={type} title={title} disabled={disabled || loading} onClick={onClick}
-      className={`btn ${v} ${s} ${className}`}>
-      {loading ? <Loader2 size={14} className="animate-spin" /> : icon}
-      {translateNode(children, t)}
-    </button>
-  );
+function captureReturnFocus() {
+  const active = document.activeElement;
+  const menu = active?.closest?.("[role='menu']");
+  const triggerId = menu?.getAttribute("data-return-focus-id");
+  return (triggerId && document.getElementById(triggerId)) || active;
 }
 
-export function IconBtn({ icon, onClick, title, danger, active, className = "" }) {
+// ---------------- 基础 ---------------- //
+/** @type {import("react").ForwardRefExoticComponent<import("./legacy-types").LegacyButtonProps & import("react").RefAttributes<HTMLButtonElement>>} */
+export const Button = forwardRef(function Button({ children, onClick, variant = "primary", size = "md", icon, disabled, loading, className = "", type = "button", title, ...props }, ref) {
+  const { t } = useApp();
+  const v = { primary: "default", secondary: "outline", ghost: "ghost", danger: "destructive", dangerSoft: "outline", success: "default" }[variant] || "default";
+  const s = { sm: "sm", md: "default", lg: "lg" }[size] || "default";
+  return (
+    <PrimitiveButton ref={ref} {...props} type={type} title={title} variant={v} size={s} disabled={disabled || loading} aria-busy={loading || undefined} onClick={onClick}
+      className={cn("btn", variant === "dangerSoft" && "border-destructive/30 text-destructive hover:bg-destructive/10", className)}>
+      {loading ? <Loader2 size={14} className="animate-spin" /> : icon}
+      {translateNode(children, t)}
+    </PrimitiveButton>
+  );
+});
+
+/** @type {import("react").ForwardRefExoticComponent<import("./legacy-types").LegacyIconButtonProps & import("react").RefAttributes<HTMLButtonElement>>} */
+export const IconBtn = forwardRef(function IconBtn({ icon, onClick, title, danger, active, className = "", ...props }, ref) {
   const { t } = useApp();
   return (
-    <button title={t(title)} onClick={onClick}
-      className={`inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 ${danger ? "hover:text-red-600" : ""} ${active ? "bg-slate-100 text-slate-800" : ""} ${className}`}>
+    <PrimitiveButton ref={ref} {...props} type="button" variant="ghost" size="icon" title={t(title)} aria-label={t(title || "更多操作")} onClick={onClick}
+      className={cn("h-8 w-8 text-muted-foreground", danger && "hover:text-destructive", active && "bg-accent text-accent-foreground", className)}>
       {icon}
-    </button>
+    </PrimitiveButton>
   );
-}
+});
 
 const COLOR_MAP = {
   success: "bg-emerald-50 text-emerald-700 border-emerald-200",
@@ -72,15 +82,15 @@ export function Tag({ children, onRemove, color = "neutral" }) {
 export function Panel({ title, extra, children, className = "", bodyClass = "", pad = true }) {
   const { t } = useApp();
   return (
-    <div className={`panel ${className}`}>
+    <Card className={cn("panel", className)}>
       {(title || extra) && (
-        <div className="panel-head">
+        <CardHeader className="panel-head flex-row space-y-0">
           <div className="panel-title">{typeof title === "string" ? t(title) : title}</div>
           {extra}
-        </div>
+        </CardHeader>
       )}
-      <div className={pad ? `p-4 ${bodyClass}` : bodyClass}>{children}</div>
-    </div>
+      <CardContent className={cn(pad ? "ops-panel-body" : "p-0", bodyClass)}>{children}</CardContent>
+    </Card>
   );
 }
 
@@ -92,7 +102,7 @@ export function Input({ label, hint, error, icon, className = "", ...props }) {
       {label && <span className="mb-1 block text-xs font-medium text-slate-600">{t(label)}</span>}
       <div className="relative">
         {icon && <span className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400">{icon}</span>}
-        <input {...props} className={`input ${icon ? "pl-8" : ""} ${error ? "border-red-400" : ""} ${className}`} />
+        <PrimitiveInput {...props} aria-invalid={!!error} className={cn("input", icon && "pl-8", error && "border-destructive", className)} />
       </div>
       {hint && !error && <span className="mt-1 block text-[11px] text-slate-400">{t(hint)}</span>}
       {error && <span className="mt-1 block text-[11px] text-red-600">{t(error)}</span>}
@@ -121,13 +131,10 @@ export function Select({ label, options, value, onChange, className = "", placeh
 export function Switch({ checked, onChange, label, disabled }) {
   const { t } = useApp();
   return (
-    <button type="button" disabled={disabled} onClick={() => onChange(!checked)}
-      className={`flex items-center gap-2 disabled:opacity-50`}>
-      <span className={`relative inline-flex h-5 w-9 shrink-0 rounded-full transition-colors ${checked ? "bg-blue-600" : "bg-slate-300"}`}>
-        <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all ${checked ? "left-[18px]" : "left-0.5"}`} />
-      </span>
+    <label className="inline-flex min-h-9 items-center gap-2 cursor-pointer">
+      <PrimitiveSwitch checked={checked} onCheckedChange={onChange} disabled={disabled} aria-label={t(label || "切换设置")} />
       {label && <span className="text-[13px] text-slate-700">{t(label)}</span>}
-    </button>
+    </label>
   );
 }
 
@@ -216,19 +223,20 @@ export function ProgressBar({ value, color = "bg-blue-600", height = "h-1.5", sh
 // ---------------- 弹窗 / 抽屉 ---------------- //
 export function Modal({ open, onClose, title, children, footer, width = 560, closable = true }) {
   const { t } = useApp();
-  if (!open) return null;
+  const returnFocus = useRef(null);
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-slate-900/40" onClick={closable ? onClose : undefined} />
-      <div className="relative z-10 flex max-h-[88vh] w-full flex-col overflow-hidden rounded-lg bg-white shadow-xl" style={{ maxWidth: width }}>
-        <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
-          <div className="text-sm font-semibold text-slate-800">{t(title)}</div>
-          {closable && <IconBtn icon={<X size={15} />} onClick={onClose} title="关闭" />}
+    <Dialog open={!!open} onOpenChange={(value) => { if (!value && closable) onClose(); }}>
+      <DialogContent aria-describedby={undefined} showClose={closable} closeLabel={t("关闭")} className="flex max-h-[88dvh] w-[calc(100vw-32px)] flex-col gap-0 overflow-hidden p-0 rounded-xl" style={{ maxWidth: width }}
+        onOpenAutoFocus={() => { returnFocus.current = captureReturnFocus(); }}
+        onCloseAutoFocus={(event) => { event.preventDefault(); returnFocus.current?.focus?.(); }}
+        onEscapeKeyDown={(event) => { if (!closable) event.preventDefault(); }} onInteractOutside={(event) => { if (!closable) event.preventDefault(); }}>
+        <div className="flex items-center justify-between border-b border-border px-5 py-5 pr-14">
+          <DialogTitle>{t(title)}</DialogTitle>
         </div>
-        <div className="flex-1 overflow-auto px-4 py-4">{children}</div>
-        {footer && <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-3">{footer}</div>}
-      </div>
-    </div>
+        <div className="min-h-0 flex-1 overflow-auto px-5 py-5">{children}</div>
+        {footer && <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border bg-muted/30 px-5 py-4">{footer}</div>}
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -253,19 +261,18 @@ export function Confirm({ open, onClose, onConfirm, title = "确认操作", mess
 
 export function Drawer({ open, onClose, title, children, footer, width = 640 }) {
   const { t } = useApp();
-  if (!open) return null;
+  const returnFocus = useRef(null);
   return (
-    <div className="fixed inset-0 z-50">
-      <div className="absolute inset-0 bg-slate-900/30" onClick={onClose} />
-      <div className="absolute inset-y-0 right-0 flex w-full flex-col border-l border-slate-200 bg-white shadow-xl" style={{ maxWidth: width }}>
-        <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
-          <div className="text-sm font-semibold text-slate-800">{t(title)}</div>
-          <IconBtn icon={<X size={15} />} onClick={onClose} title="关闭" />
+    <Sheet open={!!open} onOpenChange={(value) => { if (!value) onClose(); }}>
+      <SheetContent aria-describedby={undefined} closeLabel={t("关闭")} className="flex w-full flex-col gap-0 p-0 sm:max-w-none" style={{ maxWidth: width }}
+        onOpenAutoFocus={() => { returnFocus.current = captureReturnFocus(); }} onCloseAutoFocus={(event) => { event.preventDefault(); returnFocus.current?.focus?.(); }}>
+        <div className="flex items-center justify-between border-b border-border px-5 py-5 pr-14">
+          <SheetTitle>{t(title)}</SheetTitle>
         </div>
-        <div className="flex-1 overflow-auto">{children}</div>
-        {footer && <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-4 py-3">{footer}</div>}
-      </div>
-    </div>
+        <div className="min-h-0 flex-1 overflow-auto">{children}</div>
+        {footer && <div className="flex items-center justify-end gap-2 border-t border-border px-5 py-4">{footer}</div>}
+      </SheetContent>
+    </Sheet>
   );
 }
 
@@ -290,31 +297,14 @@ export function Tabs({ tabs, active, onChange, size = "md" }) {
 // ---------------- 下拉菜单 ---------------- //
 export function Dropdown({ trigger, items, align = "right" }) {
   const { t } = useApp();
-  const [open, setOpen] = useState(false);
-  const ref = useRef(null);
-  useEffect(() => {
-    const h = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
-    document.addEventListener("mousedown", h);
-    return () => document.removeEventListener("mousedown", h);
-  }, []);
+  const triggerRef = useRef(null);
   return (
-    <div className="relative" ref={ref}>
-      <div onClick={() => setOpen((o) => !o)}>{trigger}</div>
-      {open && (
-        <div className={`absolute z-30 mt-1 min-w-[160px] rounded-md border border-slate-200 bg-white py-1 shadow-lg ${align === "right" ? "right-0" : "left-0"}`}>
-          {items.map((it, i) =>
-            it.divider ? (
-              <div key={i} className="my-1 border-t border-slate-100" />
-            ) : (
-              <button key={i} disabled={it.disabled} onClick={() => { setOpen(false); it.onClick?.(); }}
-                className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] hover:bg-slate-50 disabled:opacity-50 ${it.danger ? "text-red-600" : "text-slate-700"}`}>
-                {it.icon}{typeof it.label === "string" ? t(it.label) : it.label}
-              </button>
-            ),
-          )}
-        </div>
-      )}
-    </div>
+    <DropdownMenu>
+      <DropdownMenuTrigger ref={triggerRef} asChild>{trigger}</DropdownMenuTrigger>
+      <DropdownMenuContent data-return-focus-id={triggerRef.current?.id} align={align === "right" ? "end" : "start"} className="min-w-40">
+        {items.map((item, index) => item.divider ? <DropdownMenuSeparator key={index} /> : <DropdownMenuItem key={index} disabled={item.disabled} onSelect={() => item.onClick?.()} className={item.danger ? "text-destructive focus:text-destructive" : ""}>{item.icon}{typeof item.label === "string" ? t(item.label) : item.label}</DropdownMenuItem>)}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
@@ -414,21 +404,21 @@ export function StatCard({ label, value, sub, trend, trendDir, icon, onClick, lo
   const { t } = useApp();
   const trendColor = trendDir === "up" ? "text-emerald-600" : trendDir === "down" ? "text-red-600" : "text-slate-400";
   return (
-    <div onClick={onClick} className={`panel p-4 ${onClick ? "cursor-pointer transition-shadow hover:shadow-sm" : ""}`}>
+    <Card onClick={onClick} role={onClick ? "button" : undefined} tabIndex={onClick ? 0 : undefined} onKeyDown={onClick ? (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onClick(); } } : undefined} className={`panel ops-stat ${onClick ? "cursor-pointer" : ""}`}>
       <div className="flex items-start justify-between">
         <div>
-          <div className="text-xs text-slate-500">{typeof label === "string" ? t(label) : label}</div>
-          <div className="tnum mt-1.5 text-[26px] font-semibold leading-none text-slate-800">
+          <div className="ops-stat-label">{typeof label === "string" ? t(label) : label}</div>
+          <div className="tnum ops-stat-value">
             {loading ? <Loader2 size={20} className="animate-spin text-slate-300" /> : value}
           </div>
         </div>
-        {icon && <div className="rounded-md bg-blue-50 p-2 text-blue-600">{icon}</div>}
+        {icon && <div className="ops-stat-icon">{icon}</div>}
       </div>
-      <div className="mt-2.5 flex items-center gap-2 text-xs">
+      <div className="ops-stat-footer">
         {trend != null && <span className={`tnum font-medium ${trendColor}`}>{trendDir === "up" ? "↑" : "↓"} {trend}%</span>}
-        {sub && <span className="text-slate-400">{typeof sub === "string" ? t(sub) : sub}</span>}
+        {sub && <span>{typeof sub === "string" ? t(sub) : sub}</span>}
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -477,7 +467,7 @@ export function useAsyncData(fetcher, deps = []) {
       }
     }, 350);
     return () => { alive = false; clearTimeout(timer); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // Legacy callers explicitly control when their fetcher is refreshed.
   }, [...deps, tick]);
 
   return { data, setData, loading, error, reload: () => setTick((t) => t + 1) };
@@ -487,17 +477,17 @@ export function useAsyncData(fetcher, deps = []) {
 export function PageHeader({ title, subtitle, extra, badge }) {
   const { t } = useApp();
   return (
-    <div className="flex flex-wrap items-center justify-between gap-2">
+    <div className="ops-page-header">
       <div className="flex items-center gap-2.5">
         <div>
           <div className="flex items-center gap-2">
-            <h2 className="text-[16px] font-semibold text-slate-800">{typeof title === "string" ? t(title) : title}</h2>
+            <h1>{typeof title === "string" ? t(title) : title}</h1>
             {badge}
           </div>
-          {subtitle && <div className="mt-0.5 text-xs text-slate-400">{typeof subtitle === "string" ? t(subtitle) : subtitle}</div>}
+          {subtitle && <p>{typeof subtitle === "string" ? t(subtitle) : subtitle}</p>}
         </div>
       </div>
-      {extra && <div className="flex items-center gap-2">{extra}</div>}
+      {extra && <div className="ops-page-header-actions">{extra}</div>}
     </div>
   );
 }

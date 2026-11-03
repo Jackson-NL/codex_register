@@ -295,7 +295,7 @@ export function defaultSettings() {
     },
     oauth: {
       callbackUrl: "https://ops.example.com/api/auth/callback",
-      allowedOrigins: "https://ops.example.com, http://localhost:5173",
+      allowedOrigins: "https://ops.example.com, http://localhost:5180",
       clientName: "ops-console",
       connected: true,
     },

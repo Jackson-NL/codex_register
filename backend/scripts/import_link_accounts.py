@@ -1,4 +1,4 @@
-"""从 Sub2API 账号导出 JSON 导入本地 Account（供提链工作台等使用）。
+"""从 Sub2API 账号导出 JSON 导入本地 Account，供账号管理使用。
 
 用法：
     python scripts/import_link_accounts.py "E:\\down\\sub2api-account-xxx.json" [--dry-run]
