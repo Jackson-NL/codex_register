@@ -17,8 +17,11 @@ func (h *Handlers) GetStats(w http.ResponseWriter, r *http.Request) {
 		return n
 	}
 	totalAccounts := row("SELECT COUNT(*) FROM accounts")
-	// 账号状态只分两态：正常 / 异常（与 backend/app/api/stats.py、
-	// internal/api/account_status.go 同一口径）。底层取值仍多样，但不再分别上报计数。
+	// 账号状态只分两态：正常 / 异常。
+	// ⚠️ 局限：这里只能按 status 字段计数。FastAPI 的完整口径是「status 正常 **且**
+	// 凭据当下可用」（JWT exp 需 base64 解码，SQL 无法计算，见
+	// backend/app/services/account_status.py）。因此网关的 normal_accounts 会偏高——
+	// 需要精确值请走 FastAPI 的 /api/stats；本实现仅作无 Python 进程时的降级视图。
 	normalAccounts := row(statusCountQuery(statusNormal))
 	abnormalAccounts := row(statusCountQuery(statusAbnormal))
 	todaySuccess := row("SELECT COUNT(*) FROM registrations WHERE status='success' AND date(finished_at)=date('now','localtime')")

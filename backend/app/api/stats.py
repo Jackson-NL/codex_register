@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..models import Account, GmailSession, Proxy, Registration
-from ..services.account_status import ABNORMAL, NORMAL, status_case
+from ..services.account_status import NORMAL, health_of, status_case
 
 router = APIRouter()
 
@@ -12,11 +12,19 @@ router = APIRouter()
 @router.get("/stats")
 def get_stats(db: Session = Depends(get_db)):
     total_accounts = db.scalar(select(func.count(Account.id))) or 0
-    # 账号状态只分两态：正常 / 异常（口径唯一真源 services/account_status.py）。
-    # 冷却中、已暂停、停用等底层取值不再各自上报计数——同一个字段在 UI 上被拆成
-    # 四五种口径会让"正常/异常"这个唯一问题变得无法回答。
-    normal_accounts = db.scalar(select(func.count(Account.id)).where(status_case(NORMAL))) or 0
-    abnormal_accounts = db.scalar(select(func.count(Account.id)).where(status_case(ABNORMAL))) or 0
+    # 账号状态只分两态：正常 / 异常。完整口径是「status 正常 **且** 凭据当下可用」
+    # （唯一真源 services/account_status.py）。JWT 的 exp 无法在 SQL 里算，所以先按
+    # status 粗筛候选，再在 Python 侧用 health_of 精确判定——否则 1387 个「status=active
+    # 但 AT 早已过期」的账号会被算成正常。
+    candidates = db.execute(
+        select(Account.status, Account.access_token).where(status_case(NORMAL))
+    ).all()
+    normal_accounts = sum(
+        1
+        for status, token in candidates
+        if health_of({"status": status, "access_token": token}) == NORMAL
+    )
+    abnormal_accounts = total_accounts - normal_accounts
 
     today_success = db.scalar(
         select(func.count(Registration.id)).where(

@@ -142,3 +142,68 @@ def test_sql_bucket_matches_python_for_blank_and_padded_values():
     assert (payload["normal_accounts"], payload["abnormal_accounts"]) == (1, 2)
     assert payload["normal_accounts"] + payload["abnormal_accounts"] == payload["total_accounts"]
     db.close()
+
+
+def test_credentials_usable_boundaries():
+    """凭据可用性：过期 / 无 AT / 脏时间 → 不可用；无 exp → 按可用（非 JWT 场景）。"""
+    from datetime import datetime, timedelta
+
+    from app.services.account_status import credentials_usable
+
+    now = datetime(2026, 11, 4, 12, 0, 0)
+    assert credentials_usable("at", now + timedelta(days=1), now=now) is True
+    assert credentials_usable("at", now - timedelta(days=1), now=now) is False
+    assert credentials_usable("", now + timedelta(days=1), now=now) is False
+    assert credentials_usable("at", None, now=now) is True
+    assert credentials_usable("at", "not-a-date", now=now) is False
+
+
+def test_health_requires_both_status_and_credentials():
+    """核心口径：status 正常「且」凭据可用才算正常（用户报的那个矛盾的根因）。"""
+    from datetime import datetime, timedelta
+
+    from app.services.account_status import health_of
+
+    now = datetime(2026, 11, 4, 12, 0, 0)
+    future = now + timedelta(days=1)
+    past = now - timedelta(days=1)
+
+    # status=active 但 AT 过期 —— 以前算正常，现在必须异常
+    assert health_of({"status": "active", "access_token": "at"}, expires_at=past, now=now) == ABNORMAL
+    assert health_of({"status": "active", "access_token": "at"}, expires_at=future, now=now) == NORMAL
+    # status 本身异常 —— 无论凭据如何都异常
+    assert health_of({"status": "disabled", "access_token": "at"}, expires_at=future, now=now) == ABNORMAL
+    # 无凭据 —— 异常
+    assert health_of({"status": "active", "access_token": ""}, expires_at=None, now=now) == ABNORMAL
+
+
+def test_stats_excludes_expired_credentials_from_normal():
+    """stats 的 normal 必须排除「status 正常但 AT 已过期」的账号。"""
+    from datetime import datetime, timedelta, timezone
+
+    import jwt
+
+    factory, _ = memory_session_factory()
+    db = factory()
+
+    def token(exp_at):
+        return jwt.encode({"exp": int(exp_at.timestamp())}, "k" * 32, algorithm="HS256")
+
+    future = datetime.now(timezone.utc) + timedelta(days=1)
+    past = datetime.now(timezone.utc) - timedelta(days=1)
+
+    fresh = Account(phone="p_fresh", email="fresh@example.com", status="active")
+    fresh.access_token = token(future)
+    stale = Account(phone="p_stale", email="stale@example.com", status="active")
+    stale.access_token = token(past)
+    off = Account(phone="p_off", email="off@example.com", status="disabled")
+    off.access_token = token(future)
+    for account in (fresh, stale, off):
+        db.add(account)
+    db.commit()
+
+    payload = stats_api.get_stats(db)
+    assert payload["total_accounts"] == 3
+    assert payload["normal_accounts"] == 1      # 只有 fresh
+    assert payload["abnormal_accounts"] == 2    # stale（过期）+ off（停用）
+    db.close()

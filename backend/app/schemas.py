@@ -46,6 +46,12 @@ class AccountOut(OrmModel):
     has_id_token: bool = False
     # 真实凭证状态（由列表/详情接口计算，非 ORM 字段）
     has_access_token: bool = False
+    # 是否存有登录密码（只暴露布尔，密码本身永不出列表接口）：
+    # 「从本地账号选号重登」需要据此判断该账号能否走协议登录。
+    has_password: bool = False
+    # 账号健康两态结论（normal / abnormal）：status 正常「且」凭据当下可用才算正常。
+    # 由接口用 services/account_status.health_of() 计算，前端直接消费，不要自己再算。
+    health: str = "abnormal"
     token_expires_at: datetime | None = None
     # 服务端脱敏后的凭证片段（列表页展示用，全文只在详情接口返回）
     access_token_masked: str | None = None

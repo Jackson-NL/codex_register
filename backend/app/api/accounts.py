@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from ..db import SessionLocal, get_db
 from ..models import Account, AccountSub2APIUpload, HealthCheck, Registration, utcnow
 from ..schemas import AccountDetail, AccountOut, Sub2APIUploadSummary
-from ..services.account_status import ABNORMAL, NORMAL, status_case
+from ..services.account_status import ABNORMAL, NORMAL, health_of, status_case
 from ..services.sub2api import summarize_sub2api_upload_status
 from ..services.oauth_policy import oauth_block_reason, oauth_eligibility
 from ..services.token_utils import parse_jwt_exp
@@ -263,7 +263,11 @@ def _account_detail(account: Account, db: Session) -> AccountDetail:
     item.has_refresh_token = bool(account.refresh_token)
     item.has_id_token = bool(account.id_token)
     item.has_access_token = bool(account.access_token)
+    # 只暴露「有没有密码」的布尔值，密码本身永不出列表接口
+    item.has_password = bool(account.password)
     item.token_expires_at = parse_jwt_exp(account.access_token)
+    # 复用已解析的 exp，避免二次解码 JWT
+    item.health = health_of(account, expires_at=item.token_expires_at)
     item.access_token_masked = _mask_token(account.access_token)
     item.refresh_token_masked = _mask_token(account.refresh_token)
     item.totp_secret_masked = _mask_totp(account.totp_secret)
@@ -539,7 +543,9 @@ def list_accounts(
         item.has_refresh_token = bool(a.refresh_token)
         item.has_id_token = bool(a.id_token)
         item.has_access_token = bool(a.access_token)
+        item.has_password = bool(a.password)
         item.token_expires_at = parse_jwt_exp(a.access_token)
+        item.health = health_of(a, expires_at=item.token_expires_at)
         item.access_token_masked = _mask_token(a.access_token)
         item.refresh_token_masked = _mask_token(a.refresh_token)
         item.totp_secret_masked = _mask_totp(a.totp_secret)
@@ -1354,7 +1360,11 @@ def get_account(account_id: int, db: Session = Depends(get_db)):
     item.has_refresh_token = bool(account.refresh_token)
     item.has_id_token = bool(account.id_token)
     item.has_access_token = bool(account.access_token)
+    # 只暴露「有没有密码」的布尔值，密码本身永不出列表接口
+    item.has_password = bool(account.password)
     item.token_expires_at = parse_jwt_exp(account.access_token)
+    # 复用已解析的 exp，避免二次解码 JWT
+    item.health = health_of(account, expires_at=item.token_expires_at)
     item.access_token_masked = _mask_token(account.access_token)
     item.refresh_token_masked = _mask_token(account.refresh_token)
     item.totp_secret_masked = _mask_totp(account.totp_secret)
@@ -1381,7 +1391,11 @@ def write_totp(account_id: int, payload: TotpBody, db: Session = Depends(get_db)
     item.has_refresh_token = bool(account.refresh_token)
     item.has_id_token = bool(account.id_token)
     item.has_access_token = bool(account.access_token)
+    # 只暴露「有没有密码」的布尔值，密码本身永不出列表接口
+    item.has_password = bool(account.password)
     item.token_expires_at = parse_jwt_exp(account.access_token)
+    # 复用已解析的 exp，避免二次解码 JWT
+    item.health = health_of(account, expires_at=item.token_expires_at)
     item.access_token_masked = _mask_token(account.access_token)
     item.refresh_token_masked = _mask_token(account.refresh_token)
     item.totp_secret_masked = _mask_totp(account.totp_secret)
@@ -1405,7 +1419,11 @@ def patch_account(account_id: int, payload: AccountPatch, db: Session = Depends(
     item.has_refresh_token = bool(account.refresh_token)
     item.has_id_token = bool(account.id_token)
     item.has_access_token = bool(account.access_token)
+    # 只暴露「有没有密码」的布尔值，密码本身永不出列表接口
+    item.has_password = bool(account.password)
     item.token_expires_at = parse_jwt_exp(account.access_token)
+    # 复用已解析的 exp，避免二次解码 JWT
+    item.health = health_of(account, expires_at=item.token_expires_at)
     item.access_token_masked = _mask_token(account.access_token)
     item.refresh_token_masked = _mask_token(account.refresh_token)
     item.totp_secret_masked = _mask_totp(account.totp_secret)

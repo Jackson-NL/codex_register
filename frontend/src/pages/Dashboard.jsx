@@ -10,7 +10,7 @@ import { Panel, StatCard, Badge, Button, useAsyncData, Empty } from "../componen
 import { useApp } from "../context/AppContext";
 import { api } from "../api";
 import { fmtTime, fmtAgo } from "../mock/data";
-import { accStatus } from "./accountsShared";
+import { accStatus, isHealthy } from "./accountsShared";
 
 const PIE_COLORS = { normal: "#208d72", abnormal: "#d76e73" };
 const TASK_BADGE = {
@@ -64,10 +64,14 @@ export default function Dashboard() {
 
   const { data: stats } = useAsyncData(() => api.stats.get());
   const { data: registrations } = useAsyncData(() => api.registrations.list({ limit: 200 }));
-  // 异常账号清单：走两态伪值 abnormal（口径同账号页徽标）。
-  // 旧写法 status=unhealthy 查的是后端从不写入的取值，面板因此恒为"暂无异常账号"，
-  // 与账号页能看到的异常账号互相矛盾。
-  const { data: abnormalAccounts } = useAsyncData(() => api.accounts.list({ status: "abnormal" }));
+  // 异常账号清单：后端 `?status=abnormal` 只能按 status 字段粗筛，会漏掉
+  // 「status=active 但 AT 已过期」的账号（实测 1387 个），所以这里拉一批后
+  // 在前端按 health 精确过滤，与账号页徽标、饼图口径完全一致。
+  const { data: accountPool } = useAsyncData(() => api.accounts.list({ limit: 500 }));
+  const abnormalAccounts = useMemo(
+    () => (accountPool || []).filter((a) => !isHealthy(a)),
+    [accountPool],
+  );
 
   const trend = useMemo(() => buildTrend(registrations), [registrations]);
 

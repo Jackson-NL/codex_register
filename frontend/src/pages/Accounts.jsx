@@ -11,7 +11,7 @@ import {
 import { useApp } from "../context/AppContext";
 import { api } from "../api";
 import AccountsRefreshPanel from "./AccountsRefreshPanel";
-import { StatPill, loadSavedViews, persistSavedViews, credentialFilter, isNormalStatus } from "./accountsShared";
+import { StatPill, loadSavedViews, persistSavedViews, credentialFilter, isHealthy } from "./accountsShared";
 import { AccountsToolbar, BatchActionBar } from "./AccountsToolbar";
 import { buildColumns, AccountsTable } from "./AccountsTable";
 import { AccountsDetailDrawer } from "./AccountsDetailDrawer";
@@ -154,8 +154,9 @@ export default function Accounts() {
     if (!raw) return [];
     let list = raw.filter((a) => {
       if (filters.health !== "all") {
-        // 两态判定与徽标同源（isNormalStatus），不再在此重复列一遍底层取值。
-        const isNormal = isNormalStatus(a.status);
+        // 两态判定与徽标同源（isHealthy → accStatus → 后端 health 字段），
+        // 不再只看 status，避免「筛选说正常、徽标说异常」。
+        const isNormal = isHealthy(a);
         if (filters.health === "normal" && !isNormal) return false;
         if (filters.health === "abnormal" && isNormal) return false;
       }
@@ -200,7 +201,7 @@ export default function Accounts() {
       filtered: rows.length,
       withAt: count((a) => a.has_access_token),
       withRt: count((a) => a.has_refresh_token),
-      problem: count((a) => credentialFilter(a) === "problem"),
+      problem: count((a) => credentialFilter(a) === "abnormal"),
       missingProfile: count((a) => !a.profile_path),
     };
   }, [raw, rows.length]);
@@ -646,7 +647,7 @@ export default function Accounts() {
           <div className="flex flex-wrap gap-2">
             <StatPill label="账号总数" value={stats.total} tone="blue" helper={`当前筛选 ${stats.filtered}`} onClick={() => { setFilters((f) => ({ ...f, cred: "all", health: "all" })); }} active={filters.cred === "all" && filters.health === "all"} />
             <StatPill label="已保存 AT / RT" value={`${stats.withAt}/${stats.withRt}`} tone="emerald" helper="可复制完整值" />
-            <StatPill label="凭据已过期" value={stats.problem} tone="red" helper={`缺 Profile ${stats.missingProfile}`} onClick={() => setFilter("cred", "problem")} active={filters.cred === "problem"} />
+            <StatPill label="凭据异常" value={stats.problem} tone="red" helper={`缺 Profile ${stats.missingProfile}`} onClick={() => setFilter("cred", "abnormal")} active={filters.cred === "abnormal"} />
           </div>
         </div>
       </div>

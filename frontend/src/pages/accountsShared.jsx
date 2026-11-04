@@ -4,20 +4,41 @@ import { fmtAgo } from "../mock/data";
 
 export const PLAN_COLOR = { free: "neutral", plus: "info", pro: "primary", team: "warning", enterprise: "danger" };
 
-// 凭据状态仅由 access token 是否存在及过期时间判断。
+// 凭据状态也只分两态：正常 / 异常。
+//   正常 = 有 access_token 且未过期（可用）
+//   异常 = 无凭证、已过期、或过期时间无法解析（一切不可用，fail-closed）
+// 与账号状态同一套展示口径，避免同一个列表里两列各说一套「正常/异常」。
+export const CRED_TEXT = { normal: "正常", abnormal: "异常" };
+
+export const CRED_STATUS = {
+  normal: ["success", CRED_TEXT.normal],
+  abnormal: ["danger", CRED_TEXT.abnormal],
+};
+
+// 判定依据只看「能不能用」：有 AT 且未过期才算正常。
+export const isCredUsable = (a) => {
+  if (!a.has_access_token) return false;
+  if (!a.token_expires_at) return true; // 未记录过期时间按可用处理（后端无 exp 时如此）
+  const t = new Date(a.token_expires_at).getTime();
+  if (Number.isNaN(t)) return false;    // 解析失败属于脏数据，按异常处理
+  return t > Date.now();
+};
+
+// 传入账号对象或布尔值都可，调用方不必各写一套。
 export const credState = (a) => {
-  if (!a.has_access_token) return { label: "无凭证", color: "neutral" };
-  if (a.token_expires_at && new Date(a.token_expires_at).getTime() <= Date.now()) return { label: "已过期", color: "danger" };
-  return { label: "凭据有效", color: "success" };
+  const usable = typeof a === "boolean" ? a : isCredUsable(a);
+  return CRED_STATUS[usable ? "normal" : "abnormal"];
 };
 
 // 账号状态只分两态：正常 / 异常。
-// 判定口径的唯一真源是 backend/app/services/account_status.py（Go 侧同见
-// gateway/internal/api/account_status.go）；底层 accounts.status 仍有
-// active / cooling / paused / disabled 等取值，但对外一律收敛为两态：
-//   正常 = active、cooling（冷却会自动恢复，本身可用）
-//   异常 = 其余一切取值（含空值与未来新值，fail-closed）
-// 新增底层取值时不需要改这里——不在 NORMAL_STATUSES 里就自动归为异常。
+// **正常 = 账号可用**：status 正常「且」凭据当下可用（后端 health 字段已算好）。
+// 判定唯一真源是 backend/app/services/account_status.py（Go 侧同见
+// gateway/internal/api/account_status.go）。底层 accounts.status 仍有
+// active / cooling / paused / disabled 等取值，但对外一律用两态结论。
+//
+// 关键：优先读后端下发的 `a.health` 字段。status 是没人维护的旧标记，实测有 1387 个
+// 账号 status=active 但 AT 早就过期；若前端只看 status，就会把它们显示成「正常」，
+// 与「凭据状态」互相矛盾。只有拿不到 health 时（如乐观更新的临时对象）才退回按 status 判。
 export const NORMAL_STATUSES = ["active", "cooling"];
 
 export const isNormalStatus = (status) =>
@@ -30,9 +51,22 @@ export const ACC_STATUS = {
   abnormal: ["danger", STATUS_TEXT.abnormal],
 };
 
-// 传入账号对象或裸 status 字符串都可，避免调用方两种写法各写一套判定。
-export const accStatus = (a) =>
-  ACC_STATUS[isNormalStatus(a && typeof a === "object" ? a.status : a) ? "normal" : "abnormal"];
+// 传入账号对象或裸 status 字符串都可。
+// 账号对象：优先用 health；没有时不看 status 字段的旧语义，而是用凭据可用性兜底
+// （与后端同口径），避免又出现「状态正常但凭据异常」的错乱显示。
+export const accStatus = (a) => {
+  if (a && typeof a === "object") {
+    const health = String(a.health || "").trim().toLowerCase();
+    if (health === "normal" || health === "abnormal") return ACC_STATUS[health];
+    return ACC_STATUS[isCredUsable(a) && isNormalStatus(a.status) ? "normal" : "abnormal"];
+  }
+  return ACC_STATUS[isNormalStatus(a) ? "normal" : "abnormal"];
+};
+
+// 账号是否「正常」：与徽标同一个判定，供筛选/统计使用。
+// 只看 status 会漏掉「status=active 但 AT 已过期」的账号（实测 1387 个），
+// 因此这里的语义是「可用」而不是「字段值好看」。
+export const isHealthy = (a) => accStatus(a)[1] === STATUS_TEXT.normal;
 
 export const shortValue = (value, empty = "—") => value || empty;
 
@@ -48,12 +82,8 @@ export const tokenExpiryText = (a) => {
   return `${Math.floor(s / 86400)} 天后过期`;
 };
 
-export const credentialFilter = (a) => {
-  const state = credState(a).label;
-  if (state === "凭据有效") return "alive";
-  if (state === "已过期") return "problem";
-  return "missing";
-};
+// 筛选值保持正常的语义两态（不依赖标签文案，改文案不会连带弄坏筛选）。
+export const credentialFilter = (a) => (isCredUsable(a) ? "normal" : "abnormal");
 
 // 筛选器键值定义：AccountsToolbar 与 Accounts 编排共享
 export const FILTER_DEFS = {
@@ -65,9 +95,9 @@ export const FILTER_DEFS = {
   ],
   cred: [
     { value: "all", label: "全部凭据" },
-    { value: "alive", label: "凭据有效" },
-    { value: "problem", label: "已过期" },
-    { value: "missing", label: "无凭证" },
+    // 与账号状态同构：只有正常/异常两项，值即判定结果。
+    { value: "normal", label: CRED_TEXT.normal },
+    { value: "abnormal", label: CRED_TEXT.abnormal },
   ],
   sub2api: [
     { value: "all", label: "全部 Sub2API" },
@@ -136,14 +166,17 @@ export const CopyBtn = ({ state, title, onCopy }) => (
 // localStorage 视图持久化
 const VIEWS_STORAGE_KEY = "accountops-accounts-views";
 
-// 历史视图里可能存着旧的筛选值（状态曾拆成多类，异常用 __normal/__abnormal 表示）。
-// 两态改造后这些值不在选项里，直接套用会让筛选静默失效（表现为"筛了但没筛"），
-// 因此读取时做一次归一化迁移。
+// 历史视图里可能存着旧的筛选值。两态改造后这些值不在选项里，直接套用会让
+// 筛选静默失效（表现为"筛了但没筛"），因此读取时做一次归一化迁移。
+//   health: 曾拆成多类，异常用 __normal/__abnormal 表示
+//   cred:   曾拆成 alive/problem/missing 三态
 const LEGACY_HEALTH_VALUES = { __normal: "normal", __abnormal: "abnormal", active: "normal" };
+const LEGACY_CRED_VALUES = { alive: "normal", problem: "abnormal", missing: "abnormal" };
 
 export const normalizeViewFilters = (filters) => {
   const next = { ...(filters || {}) };
   if (Object.hasOwn(LEGACY_HEALTH_VALUES, next.health)) next.health = LEGACY_HEALTH_VALUES[next.health];
+  if (Object.hasOwn(LEGACY_CRED_VALUES, next.cred)) next.cred = LEGACY_CRED_VALUES[next.cred];
   return next;
 };
 
