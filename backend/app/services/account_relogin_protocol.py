@@ -52,11 +52,77 @@ ERRORS = {
 }
 
 
+# 两条路径都失败且都没出 AT 时，谁做标题的排序依据（数值小者优先）。
+# 0 = 安全信号（回调被篡改/跳到不可信域），必须显形，不能被别的错误盖掉；
+# 1 = 账号或凭据状态，是用户下一步能直接处置的信息；
+# 2 = 链路受阻（人机验证/网络/超时/令牌问题/上游改版/邮箱验证码）；
+# 3 = 设计内停止——该步骤需要协议流程之外的能力（补手机号/选工作区/点确认）。
+# 「要手机号」排在最后：它是 OAuth 单条路径的已知边界，不是"没拿到 AT"的原因；
+# 把它顶成标题会让人以为 AT 缺失是手机号造成的。
+_ERROR_PRIORITY = {
+    "state_mismatch": 0,
+    "unsafe_redirect": 0,
+    "identity_mismatch": 0,
+    "account_deactivated": 1,
+    "invalid_credentials": 1,
+    "invalid_totp": 1,
+    "totp_required": 1,
+    "rate_limited": 1,
+    "challenge_required": 2,
+    "network_error": 2,
+    "timeout": 2,
+    "token_missing": 2,
+    "token_expired": 2,
+    "protocol_changed": 2,
+    "upstream_error": 2,
+    "email_otp_required": 2,
+    "workspace_required": 3,
+    "consent_required": 3,
+    "phone_required": 3,
+}
+
+
+def _error_rank(error: "ReloginError") -> int:
+    return _ERROR_PRIORITY.get(error.code, 2)
+
+
+# 网页 AT 来自 NextAuth 会话，邮箱+密码（+TOTP）登录完成后即存在；补手机号只是
+# Codex OAuth 授权环节的要求，与网页会话无关。因此授权流程里这些"还需要额外交互"
+# 的码对网页路径只是软阻塞：会话可能已经建好，必须继续读 /api/auth/session 验证，
+# 不能当场放弃一个本来就能拿到的 AT。
+#   phone_required / workspace_required / consent_required：都出现在登录完成之后。
+#   protocol_changed：上游步骤不认识，先探一次会话再判失败。
+# 反例 email_otp_required：邮箱验证码是登录自身尚未完成的一步，会话必然未认证，
+#   探会话只会多一次无效请求，因此保持硬失败。
+# challenge / network / timeout / invalid_* / rate_limited 等硬阻塞同样立即失败。
+WEB_SOFT_STOPS = frozenset(
+    {
+        "phone_required",
+        "workspace_required",
+        "consent_required",
+        "protocol_changed",
+    }
+)
+
+
 class ReloginError(Exception):
+    """错误文案只取自 ERRORS 白名单；context 用于附加另一条路径的白名单原因。
+
+    两条路径独立失败，先前只上报其中一条会把真实阻塞点藏起来（网页路径没拿到
+    AT，界面却只显示 OAuth 要补手机号）。context 允许在同一条文案里并列两个原因，
+    但绝不拼接任何上游原文、响应体或凭据。
+    """
+
     def __init__(self, code: str, message: str = "") -> None:
         self.code = code if code in ERRORS else "upstream_error"
-        self.message = ERRORS[self.code]  # Never propagate arbitrary upstream text.
-        super().__init__(self.message)
+        # 入参 message 仍刻意丢弃：上游原文不得进入任何用户可见文本。
+        self._message = ERRORS[self.code]
+        self.context = ""
+        super().__init__(self._message)
+
+    @property
+    def message(self) -> str:
+        return f"{self._message}；另一路径：{self.context}" if self.context else self._message
 
 
 @dataclass
@@ -403,15 +469,25 @@ class ProtocolReloginClient:
         start_url = self._json(response).get("url") or response.headers.get("location")
         if not isinstance(start_url, str):
             raise ReloginError("protocol_changed")
-        await self._navigate(urljoin(WEB, start_url))
+        blocked: ReloginError | None = None
+        try:
+            await self._navigate(urljoin(WEB, start_url))
+        except ReloginError as error:
+            if error.code not in WEB_SOFT_STOPS:
+                raise
+            # 软阻塞：不返回原始错误，先确认会话是否已经可用。
+            blocked = error
         self.on_stage("web_session")
         data = self._json(await self._request("GET", WEB + "/api/auth/session"))
         user_value = data.get("user")
         user = user_value if isinstance(user_value, dict) else {}
-        if str(user.get("email", "")).lower() != self.email:
-            raise ReloginError(
-                "identity_mismatch" if user.get("email") else "token_missing"
-            )
+        session_email = str(user.get("email", "")).lower()
+        if session_email and session_email != self.email:
+            # 身份不符永远直接拒绝，绝不返回别的账号的 token。
+            raise ReloginError("identity_mismatch")
+        if not session_email:
+            # 会话没建起来：报出导航阶段的真实阻塞点，不用 token_missing 掩盖。
+            raise blocked or ReloginError("token_missing")
         token = _usable_token(data.get("accessToken") or data.get("access_token"))
         cookie = ""
         try:
@@ -535,7 +611,21 @@ class ProtocolReloginClient:
             if not result.access_token:
                 result.access_token = result.web_access_token
             if not result.access_token:
-                raise oauth_error or web_error or ReloginError("token_missing")
+                # 两条路径都失败且都没出 AT：标题取"最能解释为什么没有 AT"的那个，
+                # 另一个作为并列原因附在文案里。旧写法 `oauth_error or web_error`
+                # 让 OAuth 的 phone_required 永远压过网页路径的真实失败原因，
+                # 界面于是只显示"要手机号"，把 AT 缺失的主因藏掉。
+                candidates = [e for e in (web_error, oauth_error) if e is not None]
+                if not candidates:
+                    raise ReloginError("token_missing")
+                primary = min(candidates, key=_error_rank)
+                other = next(
+                    (e for e in candidates if e is not primary and e.code != primary.code),
+                    None,
+                )
+                if other is not None:
+                    primary.context = other.message
+                raise primary
             if not result.refresh_token:
                 result.warning = "未获取 RT，已保留可用 AT" + (
                     f"；OAuth：{oauth_error.message}" if oauth_error else ""

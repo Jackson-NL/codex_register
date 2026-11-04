@@ -302,6 +302,184 @@ async def test_live_shape_web_totp_success_is_retained_when_codex_requires_phone
 
 
 @pytest.mark.asyncio
+async def test_missing_access_token_blames_web_blocker_before_oauth_phone():
+    """没拿到 AT 时，主因必须是网页路径的失败，而不是 OAuth 的「要手机号」。
+
+    复现线上现象：账号重登既没有 AT，界面却只提示「需要手机号验证」——因为旧
+    实现 `raise oauth_error or web_error` 让 OAuth 的错误永远压过网页路径。
+    """
+    password = "do-not-repeat-this-password"
+    session = ScriptedSession(
+        [
+            # 网页路径在初始化就被 Cloudflare 拦掉 → 这一步根本没出 AT。
+            ("GET", "/api/auth/csrf", Response(status=403)),
+            # OAuth 路径单独走到补手机号页 → 设计内停止，但它不是 AT 缺失的原因。
+            ("GET", "/oauth/authorize", Response(status=302, location="/add-phone")),
+            (
+                "GET",
+                "/add-phone",
+                Response(
+                    text="<title>Add phone number - OpenAI</title>"
+                    f"<p>{password}</p>"
+                ),
+            ),
+        ]
+    )
+    with pytest.raises(ReloginError) as raised:
+        await ProtocolReloginClient(session).run(EMAIL, password)
+    error = raised.value
+    assert error.code == "challenge_required"
+    # 同时把 OAuth 侧的阻塞点并列出来，避免用户以为只有手机号一个问题。
+    assert "另一路径" in error.message and "手机号" in error.message
+    # 文案仍只来自 ERRORS 白名单：不泄漏上游原文、页面标题或密码。
+    assert password not in error.message
+    assert "Add phone number" not in error.message
+
+
+@pytest.mark.asyncio
+async def test_web_at_survives_phone_block_when_session_is_authed():
+    """补手机号出现在网页路径中途时，仍要保住本可拿到的网页 AT。
+
+    add-phone 属授权流程的软阻塞：邮箱+密码已登录成功，NextAuth 会话可能已经
+    认证。旧实现在网页路径遇到 add-phone 当场放弃，从不读 /api/auth/session，
+    于是把 AT 白白丢掉并误报成"必须要手机号"。
+    """
+    session = ScriptedSession(
+        [
+            ("GET", "/api/auth/csrf", Response({"csrfToken": "csrf"})),
+            (
+                "POST",
+                "/api/auth/signin/openai",
+                Response({"url": "https://auth.openai.com/log-in"}),
+            ),
+            ("GET", "/log-in", Response(text="login")),
+            (
+                "POST",
+                "/api/accounts/authorize/continue",
+                Response({"page": {"type": "password_login"}}),
+            ),
+            (
+                "POST",
+                "/api/accounts/password/verify",
+                Response({"continue_url": "https://auth.openai.com/add-phone"}),
+            ),
+            ("GET", "/add-phone", Response(text="<title>Add phone number</title>")),
+            # 会话已认证 → AT 与手机号无关。
+            (
+                "GET",
+                "/api/auth/session",
+                Response({"user": {"email": EMAIL}, "accessToken": "web-at"}),
+            ),
+            # OAuth 侧仍要求补手机号 → 只影响 RT。
+            ("GET", "/oauth/authorize", Response(status=302, location="/add-phone")),
+            ("GET", "/add-phone", Response(text="<title>Add phone number</title>")),
+        ]
+    )
+    result = await ProtocolReloginClient(session).run(EMAIL, "pass")
+    assert result.access_token == result.web_access_token == "web-at"
+    assert result.token_source == "web" and not result.refresh_token
+    assert "手机号" in result.warning
+    assert not session.steps
+
+
+@pytest.mark.asyncio
+async def test_phone_block_without_authed_session_still_fails_as_phone():
+    """会话没建起来时不许假成功：探测后仍按真实阻塞点失败。"""
+    session = ScriptedSession(
+        [
+            ("GET", "/api/auth/csrf", Response({"csrfToken": "csrf"})),
+            (
+                "POST",
+                "/api/auth/signin/openai",
+                Response({"url": "https://auth.openai.com/log-in"}),
+            ),
+            ("GET", "/log-in", Response(text="login")),
+            (
+                "POST",
+                "/api/accounts/authorize/continue",
+                Response({"page": {"type": "password_login"}}),
+            ),
+            (
+                "POST",
+                "/api/accounts/password/verify",
+                Response({"continue_url": "https://auth.openai.com/add-phone"}),
+            ),
+            ("GET", "/add-phone", Response(text="<title>Add phone number</title>")),
+            ("GET", "/api/auth/session", Response({"user": None})),
+            ("GET", "/oauth/authorize", Response(status=302, location="/add-phone")),
+            ("GET", "/add-phone", Response(text="<title>Add phone number</title>")),
+        ]
+    )
+    with pytest.raises(ReloginError) as raised:
+        await ProtocolReloginClient(session).run(EMAIL, "do-not-echo")
+    assert raised.value.code == "phone_required"
+    assert raised.value.context == ""  # 两路同因，不重复堆同一条文案
+    assert "Add phone number" not in raised.value.message
+    assert "do-not-echo" not in raised.value.message
+    assert not session.steps
+
+
+@pytest.mark.asyncio
+async def test_authed_session_without_token_is_not_a_fake_success():
+    """会话已认证但没有可用 AT：报 token_missing，不因软阻塞而假成功。"""
+    session = ScriptedSession(
+        [
+            ("GET", "/api/auth/csrf", Response({"csrfToken": "csrf"})),
+            (
+                "POST",
+                "/api/auth/signin/openai",
+                Response({"url": "https://auth.openai.com/log-in"}),
+            ),
+            ("GET", "/log-in", Response(text="login")),
+            (
+                "POST",
+                "/api/accounts/authorize/continue",
+                Response({"page": {"type": "password_login"}}),
+            ),
+            (
+                "POST",
+                "/api/accounts/password/verify",
+                Response({"continue_url": "https://auth.openai.com/add-phone"}),
+            ),
+            ("GET", "/add-phone", Response(text="<title>Add phone number</title>")),
+            ("GET", "/api/auth/session", Response({"user": {"email": EMAIL}})),
+            ("GET", "/oauth/authorize", Response(status=302, location="/add-phone")),
+            ("GET", "/add-phone", Response(text="<title>Add phone number</title>")),
+        ]
+    )
+    with pytest.raises(ReloginError) as raised:
+        await ProtocolReloginClient(session).run(EMAIL, "pass")
+    assert raised.value.code == "token_missing"
+    assert not session.steps
+
+
+@pytest.mark.asyncio
+async def test_web_challenge_is_hard_stop_without_session_probe():
+    """人机验证是硬阻塞：不多花一次会话请求，也不把它说成手机号问题。"""
+    session = ScriptedSession(
+        web_steps()[:4]
+        + [
+            (
+                "POST",
+                "/api/accounts/password/verify",
+                Response(
+                    {"page": {"type": "captcha"}},
+                    headers={"cf-mitigated": "challenge"},
+                ),
+            ),
+            ("GET", "/oauth/authorize", Response(status=302, location="/add-phone")),
+            ("GET", "/add-phone", Response(text="<title>Add phone number</title>")),
+        ]
+    )
+    with pytest.raises(ReloginError) as raised:
+        await ProtocolReloginClient(session).run(EMAIL, "pass")
+    error = raised.value
+    assert error.code == "challenge_required"
+    assert error.context  # 手机号作为次要原因并列显示，不当标题
+    assert not [path for _m, path, _k in session.calls if path.endswith("/session")]
+
+
+@pytest.mark.asyncio
 async def test_oauth_can_succeed_when_web_session_unavailable():
     session = ScriptedSession(
         [
