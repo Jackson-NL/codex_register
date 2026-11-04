@@ -79,6 +79,10 @@ export const api = {
     cancel: (id) => POST(`/account-relogin/jobs/${encodeURIComponent(id)}/cancel`, {}, { cache: "no-store" }),
     credentials: (id, itemId) => POST(`/account-relogin/jobs/${encodeURIComponent(id)}/items/${encodeURIComponent(itemId)}/credentials`, {}, { cache: "no-store" }),
     save: (id, itemId) => POST(`/account-relogin/jobs/${encodeURIComponent(id)}/items/${encodeURIComponent(itemId)}/save`, {}, { cache: "no-store" }),
+    // 异常账号自动入队队列的只读状态（不含凭据）
+    autoQueue: () => request("/account-relogin/auto-queue", { cache: "no-store" }),
+    // 从本地账号库选号建任务：只传 id，凭据由后端读取
+    createJobFromAccounts: (body) => POST("/account-relogin/jobs/from-accounts", body, { cache: "no-store" }),
   },
 
   accounts: {

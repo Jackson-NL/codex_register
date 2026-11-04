@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowRight, CheckCircle2, ChevronDown, Copy, Database, History, KeyRound, List, LogIn, Plus, RefreshCw, RotateCcw, Save, Settings2, ShieldCheck, Square, Terminal, UserRound } from "lucide-react";
-import { Badge, Button, Input } from "../components/ui";
+import { ArrowRight, CheckCircle2, ChevronDown, Copy, Database, Eye, History, KeyRound, List, LogIn, Plus, RefreshCw, RotateCcw, Save, Settings2, ShieldCheck, Square, Terminal, UserRound, Users } from "lucide-react";
+import { Badge, Button, Input, Modal } from "../components/ui";
 import { useApp } from "../context/AppContext";
 import { api } from "../api";
+import LocalAccountPicker from "./LocalAccountPicker";
 import {
   buildReloginPayload, clearReloginSecrets, parseReloginAccounts,
   projectReloginJob, readReloginJobId, reloginJobActive, RELOGIN_STAGES,
@@ -37,6 +38,15 @@ export default function AccountRelogin() {
   const [itemBusy, setItemBusy] = useState(null);
   const [error, setError] = useState("");
   const [showBatch, setShowBatch] = useState(false);
+  // 异常账号自动入队状态（只读，不含任何凭据）
+  const [autoQueue, setAutoQueue] = useState(null);
+  // 从本地账号选号重登
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickedIds, setPickedIds] = useState([]);
+  const [pickedEmails, setPickedEmails] = useState([]);
+  // 凭据查看弹框：{ title, fields: [{ label, value }] } —— 用户自己决定是否复制
+  const [credView, setCredView] = useState(null);
+  const [credLoading, setCredLoading] = useState(false);
   const logEnd = useRef(null);
   // 最近一次提交的登录资料（仅本组件内存），用于「重试失败账号」；服务端从不保留密码/2FA
   const lastRecordsRef = useRef(null);
@@ -56,6 +66,19 @@ export default function AccountRelogin() {
   }, []);
 
   useEffect(() => { reloadHistory(); }, [reloadHistory]);
+
+  // 异常账号自动入队状态：低频轮询即可（后端默认 5 分钟一轮），失败静默不打扰。
+  useEffect(() => {
+    let disposed = false;
+    const load = () => {
+      api.accountRelogin.autoQueue()
+        .then((snapshot) => { if (!disposed) setAutoQueue(snapshot || null); })
+        .catch(() => { if (!disposed) setAutoQueue(null); });
+    };
+    load();
+    const timer = setInterval(load, 30000);
+    return () => { disposed = true; clearInterval(timer); };
+  }, []);
 
   useEffect(() => {
     if (!jobId) return undefined;
@@ -98,6 +121,38 @@ export default function AccountRelogin() {
   }, [active, job?.logs.length]);
 
   const change = (key) => (event) => setForm((previous) => ({ ...previous, [key]: event.target.value }));
+
+  // 从本地账号选号重登：只提交 id，密码由后端从库读取（不经过浏览器）。
+  const startFromLocal = async (emails, ids) => {
+    if (locked || !ids.length) return;
+    setBusy(true);
+    setError("");
+    try {
+      const response = await api.accountRelogin.createJobFromAccounts({
+        account_ids: ids,
+        proxy: String(form.proxy || "").trim(),
+        concurrency: Number(form.concurrency) || 1,
+        timeout_s: Number(form.timeout_s) || 90,
+      });
+      const created = projectReloginJob(response);
+      if (!created?.id) throw new Error("Invalid job response");
+      setJob(created);
+      setJobId(created.id);
+      saveReloginJobId(created.id, jobStorage());
+      setPickedIds([]);
+      setPickedEmails([]);
+      reloadHistory();
+      // skipped 只存在于原始响应（投影后的快照不带这个字段）
+      const skipped = Array.isArray(response?.skipped) ? response.skipped : [];
+      toast(
+        skipped.length
+          ? `已提交 ${ids.length - skipped.length} 个账号，跳过 ${skipped.length} 个`
+          : `已提交 ${ids.length} 个本地账号重登`,
+        skipped.length ? "warning" : "info",
+      );
+    } catch (failure) { setError(safeReloginError(failure)); }
+    finally { setBusy(false); }
+  };
 
   const start = async () => {
     if (locked || parsed.errors.length || !parsed.accounts.length) return;
@@ -169,24 +224,46 @@ export default function AccountRelogin() {
     finally { setBusy(false); }
   };
 
-  const copyCredentials = async (item, kind) => {
+  // 拉取完整凭据并弹框展示；是否复制由用户自己决定（不再点了就写剪贴板）。
+  const viewCredentials = async (item, kind) => {
     if (itemBusy || !jobId) return;
     setItemBusy(item.id);
+    setCredLoading(true);
     try {
-      if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
       const credentials = await api.accountRelogin.credentials(jobId, item.id);
-      const value = kind === "web"
-        ? JSON.stringify({ access_token: credentials.web_access_token || "", session_token: credentials.session_token || "" }, null, 2)
-        : credentials[kind];
-      if (!value || (kind === "web" && !credentials.web_access_token && !credentials.session_token)) {
+      const fields = [];
+      if (kind === "web") {
+        // 网页会话 = 网页 AT + session token（NextAuth 会话）
+        fields.push({ label: t("网页 AT"), value: credentials.web_access_token || "" });
+        fields.push({ label: t("session"), value: credentials.session_token || "" });
+      } else if (kind === "refresh_token") {
+        fields.push({ label: t("RT（Refresh Token）"), value: credentials.refresh_token || "" });
+      } else {
+        fields.push({ label: t("AT（Access Token）"), value: credentials.access_token || "" });
+      }
+      if (!fields.some((f) => f.value)) {
         toast("该类型凭据不可用", "warning");
         return;
       }
-      await navigator.clipboard.writeText(value);
-      toast("凭据已复制，请勿公开分享", "success");
+      setCredView({
+        title: kind === "web" ? t("session") : kind === "refresh_token" ? t("RT") : t("AT"),
+        email: item.email,
+        fields,
+      });
     } catch (failure) {
-      toast(failure?.status ? safeReloginError(failure) : "复制失败，请检查浏览器剪贴板权限", "error");
-    } finally { setItemBusy(null); }
+      toast(failure?.status ? safeReloginError(failure) : "读取凭据失败", "error");
+    } finally { setItemBusy(null); setCredLoading(false); }
+  };
+
+  // 弹框里的「复制」按钮：只复制当前这一项
+  const copyField = async (value) => {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(value);
+      toast("已复制，请勿公开分享", "success");
+    } catch {
+      toast("复制失败，请检查浏览器剪贴板权限", "error");
+    }
   };
 
   const saveAccount = async (item) => {
@@ -227,6 +304,71 @@ export default function AccountRelogin() {
 
       {error && <div role="alert" className="relogin-error">{t(error)}</div>}
 
+      {/* 异常账号自动入队：只读状态，不含任何凭据 */}
+      {autoQueue && (
+        <div className="relogin-small-tag" role="status" style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", padding: "6px 10px" }}>
+          <span>{t("异常账号自动重登")}：{autoQueue.enabled ? t("已开启") : t("未启用")}</span>
+          {autoQueue.enabled && (
+            <>
+              <span>{t("每")} {Math.round((autoQueue.interval_seconds || 0) / 60)} {t("分钟扫描")}</span>
+              <span>{t("每轮最多")} {autoQueue.batch_size} {t("个")}</span>
+              <span>{t("失败")} {autoQueue.max_attempts} {t("次后跳过")}</span>
+              {Array.isArray(autoQueue.tracked) && autoQueue.tracked.length > 0 && (
+                <span>{t("跟踪中")} {autoQueue.tracked.length} {t("个")}</span>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {/* 凭据查看弹框：显示完整值，复制与否由用户决定 */}
+      <Modal
+        open={Boolean(credView)}
+        onClose={() => setCredView(null)}
+        title={credView ? `${credView.title} · ${credView.email || ""}` : ""}
+        width={760}
+        footer={<div className="flex justify-end gap-2"><Button variant="secondary" size="sm" onClick={() => setCredView(null)}>{t("关闭")}</Button></div>}
+      >
+        <div className="space-y-3 p-1">
+          {credView?.fields.map((field) => (
+            <div key={field.label} className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-medium text-slate-600">{field.label}</span>
+                <span className="text-[10px] text-slate-400">{field.value ? `${field.value.length} ${t("字符")}` : t("不可用")}</span>
+              </div>
+              <textarea
+                readOnly
+                className="mono w-full resize-y rounded border border-slate-200 bg-slate-50 p-2 text-[11px] leading-relaxed text-slate-700"
+                rows={field.value && field.value.length > 120 ? 6 : 2}
+                value={field.value || ""}
+                aria-label={field.label}
+                spellCheck={false}
+                onFocus={(event) => event.target.select()}
+              />
+              <div className="flex justify-end">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  icon={<Copy size={11} />}
+                  disabled={!field.value}
+                  onClick={() => copyField(field.value)}
+                >
+                  {t("复制")}
+                </Button>
+              </div>
+            </div>
+          ))}
+          <p className="text-[10px] leading-5 text-slate-400">{t("完整凭据仅在本机内存中短暂存在，请勿截图或公开分享。关闭后不会自动复制。")}</p>
+        </div>
+      </Modal>
+
+      <LocalAccountPicker
+        open={pickerOpen}
+        onClose={() => setPickerOpen(false)}
+        busyEmails={new Set((job?.items || []).filter((item) => reloginJobActive(item.status)).map((item) => item.email))}
+        onPicked={(emails, ids) => { setPickedEmails(emails); setPickedIds(ids); }}
+      />
+
       <div className="relogin-grid">
         <section className="relogin-card relogin-input-card" aria-labelledby="relogin-input-title">
           <header className="relogin-card-head">
@@ -248,6 +390,39 @@ export default function AccountRelogin() {
             </div>
 
             <div className="relogin-credential-fields">
+              {/* 从本地账号库选号：正常账号也可选，凭据由后端读取 */}
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  icon={<Users size={14} />}
+                  disabled={locked}
+                  onClick={() => setPickerOpen(true)}
+                >
+                  {t("从本地账号选择")}
+                </Button>
+                {pickedIds.length > 0 && (
+                  <>
+                    <span className="text-[11px] text-slate-500">
+                      {t("已选")} <b className="tnum text-slate-800">{pickedIds.length}</b> {t("个本地账号")}
+                    </span>
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      icon={<LogIn size={13} />}
+                      loading={busy}
+                      disabled={locked}
+                      onClick={() => startFromLocal(pickedEmails, pickedIds)}
+                    >
+                      {t("重登所选账号")}
+                    </Button>
+                    <button type="button" className="text-[11px] text-slate-400 underline-offset-2 hover:text-slate-600 hover:underline" onClick={() => { setPickedIds([]); setPickedEmails([]); }}>
+                      {t("清除选择")}
+                    </button>
+                  </>
+                )}
+              </div>
+
               {form.mode === "single" ? <>
                 <Input label="邮箱" type="email" name="relogin-email" autoComplete="off" placeholder="name@example.com" icon={<UserRound size={15} />} value={form.email} onChange={change("email")} disabled={locked} maxLength={254} />
                 <Input label="密码" type="password" name="relogin-password" autoComplete="off" placeholder={t("请输入账号密码")} icon={<KeyRound size={15} />} value={form.password} onChange={change("password")} disabled={locked} maxLength={512} />
@@ -332,12 +507,12 @@ export default function AccountRelogin() {
                   {item.warning && <p className="relogin-row-warning" data-no-translate>{item.warning}</p>}
                   {item.save_error && <p className="relogin-row-error" data-no-translate>自动保存失败：{item.save_error}</p>}
                 </td>
-                <td><div className="relogin-token-badges"><Badge color={item.has_refresh_token ? "success" : "neutral"}>RT {item.has_refresh_token ? "✓" : "—"}</Badge><Badge color={item.has_access_token ? "success" : "neutral"}>AT {item.has_access_token ? "✓" : "—"}</Badge></div><div className="relogin-account-stage">{t(item.has_web_session ? "网页会话 ✓" : "网页会话 —")}</div>{item.has_access_token && <div className="relogin-account-stage">{t(item.token_source === "oauth" ? "OAuth 凭据" : "网页 AT")}</div>}</td>
+                <td><div className="relogin-token-badges"><Badge color={item.has_refresh_token ? "success" : "neutral"}>RT {item.has_refresh_token ? "✓" : "—"}</Badge><Badge color={item.has_access_token ? "success" : "neutral"}>AT {item.has_access_token ? "✓" : "—"}</Badge></div><div className="relogin-account-stage">{t(item.has_web_session ? "session ✓" : "session —")}</div>{item.has_access_token && <div className="relogin-account-stage">{t(item.token_source === "oauth" ? "OAuth 凭据" : "网页 AT")}</div>}</td>
                 <td><Status status={item.status} />{item.saved_account_id ? <div className="relogin-save-state"><CheckCircle2 size={12} />{t("已入库")} <span className="tnum">#{item.saved_account_id}</span></div> : item.has_access_token && <div className={item.save_error ? "relogin-row-error" : "relogin-account-stage"}>{t(item.save_error ? "未入库" : "等待保存")}</div>}</td>
                 <td><div className="relogin-row-actions">
-                  {item.has_access_token && <Button size="sm" variant="secondary" icon={<Copy size={11} />} disabled={Boolean(itemBusy)} onClick={() => copyCredentials(item, "access_token")}>AT</Button>}
-                  {item.has_refresh_token && <Button size="sm" variant="secondary" icon={<Copy size={11} />} disabled={Boolean(itemBusy)} onClick={() => copyCredentials(item, "refresh_token")}>RT</Button>}
-                  {item.has_web_session && <Button size="sm" variant="secondary" disabled={Boolean(itemBusy)} onClick={() => copyCredentials(item, "web")}>网页凭据</Button>}
+                  {item.has_access_token && <Button size="sm" variant="secondary" icon={<Eye size={11} />} disabled={Boolean(itemBusy)} onClick={() => viewCredentials(item, "access_token")}>AT</Button>}
+                  {item.has_refresh_token && <Button size="sm" variant="secondary" icon={<Eye size={11} />} disabled={Boolean(itemBusy)} onClick={() => viewCredentials(item, "refresh_token")}>RT</Button>}
+                  {item.has_web_session && <Button size="sm" variant="secondary" icon={<Eye size={11} />} disabled={Boolean(itemBusy)} onClick={() => viewCredentials(item, "web")}>session</Button>}
                   {item.has_access_token && <Button size="sm" variant={item.saved_account_id ? "ghost" : "secondary"} icon={item.saved_account_id ? <CheckCircle2 size={11} /> : <Save size={11} />} loading={itemBusy === item.id} disabled={Boolean(itemBusy) || Boolean(item.saved_account_id)} onClick={() => saveAccount(item)}>{item.saved_account_id ? "已保存" : item.save_error ? "重试保存" : "保存账号"}</Button>}
                 </div></td>
               </tr>)}</tbody>

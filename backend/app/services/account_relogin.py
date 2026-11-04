@@ -128,6 +128,21 @@ class AccountReloginService:
         self._active_emails: set[str] = set()
         self._slots = asyncio.Semaphore(3)
 
+    @property
+    def busy_emails(self) -> set[str]:
+        """当前排队/运行中的邮箱集合。
+
+        自动入队要据此去重：同一账号不能同时存在两个任务，否则会并发登录同一账号，
+        既浪费出口 IP 又可能触发上游风控。
+        """
+        return set(self._active_emails)
+
+    @property
+    def pending_slots(self) -> int:
+        """还能新建几个 job（并发上限保护，避免队列无限膨胀）。"""
+        self._prune()
+        return max(0, self.max_jobs - len(self._jobs))
+
     def _prune(self) -> None:
         expired = [
             key
@@ -451,6 +466,16 @@ class AccountReloginService:
 
     @staticmethod
     def _persist_result(email: str, result: ReloginResult, db: Session) -> int:
+        """把重登结果写进账号库。
+
+        关于 RT 的取舍（重要）：
+        - 这次拿到 RT：AT、RT 一起更新，最完整。
+        - 这次只拿到 AT、库里已有 RT：**新 AT 照常写库，旧 RT 原样保留**。
+          两者是不同的凭据，互不冲突：AT 决定「现在能不能用」，RT 决定「以后能不能自动续期」。
+          新 AT 很可能比库里的旧 AT 更新（旧的可能已过期），写进去立刻恢复可用；
+          旧 RT 没有变坏，没有任何理由丢掉它。早先的版本在这里直接拒绝保存，
+          导致「登录明明成功、AT 明明拿到了，却什么都没入库」，属于过度保守，已修正。
+        """
         try:
             accounts = list(
                 db.scalars(
@@ -460,25 +485,24 @@ class AccountReloginService:
             if len(accounts) > 1:
                 raise JobError(409, "本地存在多个相同邮箱，请先在账号管理中去重")
             account = accounts[0] if accounts else None
-            if account and account.refresh_token and not result.refresh_token:
-                raise JobError(
-                    409, "已有 RT，AT-only 结果未覆盖原凭据；请复制新 AT 单独使用"
-                )
             if account is None:
                 account = Account(phone=f"relogin_{uuid4().hex[:20]}", email=email)
                 db.add(account)
             account.access_token = result.access_token
+            # 只有拿到新 RT 才覆盖；库里已有的旧 RT 继续保留（见上）。
             if result.refresh_token:
                 account.refresh_token = result.refresh_token
-            account.id_token = result.id_token
+            account.id_token = result.id_token or account.id_token
             if result.account_id:
                 account.account_id = result.account_id
             if result.user_id:
                 account.user_id = result.user_id
             if result.plan_type:
                 account.plan_type = result.plan_type
+            # 刷新状态反映「是否已拥有 RT」，而不是「本次是否拿到 RT」：
+            # 只更新了 AT 时，账号仍然具备自动续期能力，不该被打回 pending。
             account.oauth_refresh_status = (
-                "success" if result.refresh_token else "pending"
+                "success" if (result.refresh_token or account.refresh_token) else "pending"
             )
             account.oauth_refresh_error = ""
             account.oauth_refreshed_at = utcnow()

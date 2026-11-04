@@ -237,7 +237,13 @@ async def test_auto_save_commit_failure_is_explicit_and_manual_retry_clears_it(c
 
 
 @pytest.mark.asyncio
-async def test_auto_save_conflict_is_visible_and_does_not_mix_old_rt_with_new_at():
+async def test_auto_save_at_only_updates_at_and_keeps_existing_rt():
+    """只拿到 AT 时：新 AT 必须入库，旧 RT 原样保留，且不报错。
+
+    AT 与 RT 是两个独立凭据：AT 管「现在能不能用」，RT 管「以后能不能自动续期」。
+    早先版本在这里直接拒绝保存（409），结果是登录成功、AT 也拿到了却什么都没入库；
+    现在改为「新 AT 照常写、旧 RT 留原样」。
+    """
     engine = memory_engine()
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine)
@@ -256,11 +262,16 @@ async def test_auto_save_conflict_is_visible_and_does_not_mix_old_rt_with_new_at
     created = await service.create_job(inputs())
     snapshot = await complete(service, created["id"])
     item = snapshot["items"][0]
-    assert item["status"] == "succeeded" and item["save_error"]
-    assert item["saved_account_id"] is None
+    # 保存成功：没有错误、拿到 saved_account_id
+    assert item["status"] == "succeeded"
+    assert item["save_error"] == ""
+    assert item["saved_account_id"]
     with factory() as db:
         account = db.scalar(select(Account))
-        assert (account.access_token, account.refresh_token) == ("old-at", "old-rt")
+        # AT 被更新为新的，RT 保持旧的
+        assert (account.access_token, account.refresh_token) == ("web-at", "old-rt")
+        # 已拥有 RT，刷新状态不应被打回 pending
+        assert account.oauth_refresh_status == "success"
     await service.shutdown()
     engine.dispose()
 
@@ -435,6 +446,7 @@ async def test_global_concurrency_limit_applies_across_jobs():
 
 @pytest.mark.asyncio
 async def test_save_preserves_password_profile_and_rt_on_conflict():
+    """手动保存：AT 更新入库，旧 RT、密码、TOTP、Profile 一律不动。"""
     engine = memory_engine()
     Base.metadata.create_all(engine)
     db = sessionmaker(bind=engine)()
@@ -456,11 +468,14 @@ async def test_save_preserves_password_profile_and_rt_on_conflict():
     service = AccountReloginService(runner=at_runner)
     created = await service.create_job(inputs())
     snapshot = await complete(service, created["id"])
-    with pytest.raises(JobError) as error:
-        service.save(created["id"], snapshot["items"][0]["id"], db)
-    assert error.value.status_code == 409
+    # 不再抛 409：AT 写库，其余原样保留
+    saved = service.save(created["id"], snapshot["items"][0]["id"], db)
+    assert saved["account_id"] == account.id
     db.refresh(account)
-    assert (account.access_token, account.refresh_token) == ("old-at", "old-rt")
+    assert (account.access_token, account.refresh_token) == ("web-at", "old-rt")
+    assert account.password == "old-password"
+    assert account.totp_secret == "old-totp"
+    assert account.profile_path == "keep-profile"
     await service.shutdown()
 
     service = AccountReloginService(runner=success_runner)

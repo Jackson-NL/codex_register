@@ -54,10 +54,24 @@ async def lifespan(app: FastAPI):
             rotator.start()
         except Exception:
             rotator = None
+    # 异常账号自动重登：把状态为「异常」且本地有密码的账号自动送进重登队列。
+    abnormal_relogin = None
+    if settings.abnormal_relogin_enabled:
+        try:
+            from .services.abnormal_relogin_scheduler import AbnormalReloginScheduler
+
+            abnormal_relogin = AbnormalReloginScheduler(relogin_service)
+            abnormal_relogin.start()
+        except Exception:
+            abnormal_relogin = None
     app.state.registration_service = service
+    app.state.abnormal_relogin_scheduler = abnormal_relogin
     try:
         yield
     finally:
+        # 先停调度器再关服务：否则调度器可能在 shutdown 之后又提交新 job。
+        if abnormal_relogin:
+            await abnormal_relogin.stop()
         await relogin_service.shutdown()
         if rotator:
             await rotator.stop()

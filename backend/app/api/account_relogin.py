@@ -161,6 +161,29 @@ class CreateJob(BaseModel):
         return self
 
 
+class CreateJobFromAccounts(BaseModel):
+    """从本地账号库选号重登：只传 id，凭据由服务端读取，不经过浏览器。"""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    account_ids: list[int] = Field(min_length=1, max_length=20)
+    proxy: SecretStr = Field(default=SecretStr(""), max_length=2048)
+    concurrency: int = Field(default=1, ge=1, le=3)
+    timeout_s: int = Field(default=90, ge=30, le=180)
+
+    @field_validator("proxy")
+    @classmethod
+    def validate_proxy(cls, value: SecretStr) -> SecretStr:
+        return CreateJob.validate_proxy(value)
+
+    @field_validator("account_ids")
+    @classmethod
+    def unique_ids(cls, value: list[int]) -> list[int]:
+        if len(value) != len(set(value)):
+            raise ValueError("同一账号请仅选择一次")
+        return value
+
+
 SERVICE = AccountReloginService(session_factory=SessionLocal)
 router = APIRouter(route_class=SecretSafeRoute, dependencies=[Depends(guard)])
 
@@ -193,6 +216,63 @@ async def create_job(
     )
 
 
+@router.post("/jobs/from-accounts")
+async def create_job_from_accounts(
+    payload: CreateJobFromAccounts, service: AccountReloginService = Depends(get_service)
+) -> dict:
+    """用本地账号库的 id 建重登任务。
+
+    密码与 TOTP 只在这一层从库里读出并直接交给重登服务（落库→内存），从不回传前端；
+    前端只传 id，因此选中正常账号也不会有凭据经过浏览器。
+    """
+    from sqlalchemy import select
+
+    from ..models import Account
+
+    records: list[dict] = []
+    skipped: list[str] = []
+    with SessionLocal() as db:
+        accounts = db.scalars(
+            select(Account).where(Account.id.in_(payload.account_ids))
+        ).all()
+        by_id = {account.id: account for account in accounts}
+        for account_id in payload.account_ids:
+            account = by_id.get(account_id)
+            if account is None:
+                skipped.append(f"#{account_id} 不存在")
+                continue
+            email = str(account.email or "").strip().lower()
+            if not email:
+                skipped.append(f"#{account_id} 无邮箱")
+                continue
+            if not (account.password or ""):
+                # 没有密码无法走协议登录，明确拒绝而不是让它稳定失败。
+                skipped.append(f"#{account_id} 本地无密码")
+                continue
+            records.append(
+                {
+                    "email": email,
+                    "password": account.password or "",
+                    "totp_secret": account.totp_secret or "",
+                }
+            )
+    if not records:
+        raise JobError(422, "所选账号均无法重登：" + "；".join(skipped[:3]))
+
+    proxy = payload.proxy.get_secret_value().strip() or str(
+        settings.default_proxy or ""
+    )
+    result = await service.create_job(
+        records,
+        proxy=proxy,
+        concurrency=payload.concurrency,
+        timeout_s=payload.timeout_s,
+    )
+    if skipped:
+        result = {**result, "skipped": skipped}
+    return result
+
+
 @router.get("/jobs")
 async def list_jobs(service: AccountReloginService = Depends(get_service)) -> dict:
     return service.list_jobs()
@@ -217,6 +297,15 @@ async def credentials(
     job_id: str, item_id: str, service: AccountReloginService = Depends(get_service)
 ) -> dict:
     return service.credentials(job_id, item_id)
+
+
+@router.get("/auto-queue")
+async def auto_queue(request: Request) -> dict:
+    """异常账号自动重登队列的只读状态（不含任何凭据）。"""
+    scheduler = getattr(request.app.state, "abnormal_relogin_scheduler", None)
+    if scheduler is None:
+        return {"enabled": False, "reason": "自动入队未启用或初始化失败"}
+    return {"enabled": True, **scheduler.snapshot()}
 
 
 @router.post("/jobs/{job_id}/items/{item_id}/save")

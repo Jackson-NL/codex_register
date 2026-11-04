@@ -101,6 +101,25 @@ class Settings(BaseSettings):
     browser_process_stale_minutes: int = 45
     playwright_driver_stale_minutes: int = 45
 
+    # ---------- 异常账号自动重登 ----------
+    # 状态为「异常」的账号自动进重登队列（口径见 services/account_status.py）。
+    # 需要本地已存 password 才能自动登录；无密码的账号会被跳过而不是反复失败。
+    abnormal_relogin_enabled: bool = True
+    # 扫描间隔：太短会频繁登录触发上游风控，默认 5 分钟一轮。
+    abnormal_relogin_interval_seconds: int = 300
+    # 每轮最多提交几个账号（受重登服务 max_jobs=20 与并发 3 共同约束）。
+    abnormal_relogin_batch_size: int = 3
+    # 单个 job 内部并发（重登服务上限 3）。
+    abnormal_relogin_concurrency: int = 1
+    # 单账号失败达到上限后进入长冷却，避免注定失败的账号持续消耗出口 IP。
+    abnormal_relogin_max_attempts: int = 3
+    abnormal_relogin_retry_cooldown_minutes: int = 60
+    # 单批等待结果的上限；超时不改状态，留给下一轮重扫。
+    abnormal_relogin_timeout_seconds: int = 120
+    # 提交前是否轮换 Clash 出口 IP：协议登录在 auth.openai.com 易被判 challenge_required
+    # （硬阻塞），轮换是提高成功率的关键项；失败不影响本轮提交。
+    abnormal_relogin_rotate_proxy: bool = True
+
     new_account_cooldown_minutes: int = 120
     registration_bind_totp: bool = False
     # 注册批次标签：自动写入新账号 accounts.tag，用于区分不同批次/风控策略下注册的账号
