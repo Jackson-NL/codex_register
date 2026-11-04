@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..models import Account, GmailSession, Proxy, Registration
+from ..services.account_status import ABNORMAL, NORMAL, status_case
 
 router = APIRouter()
 
@@ -11,10 +12,11 @@ router = APIRouter()
 @router.get("/stats")
 def get_stats(db: Session = Depends(get_db)):
     total_accounts = db.scalar(select(func.count(Account.id))) or 0
-    active_accounts = db.scalar(select(func.count(Account.id)).where(Account.status == "active")) or 0
-    cooling = db.scalar(select(func.count(Account.id)).where(Account.status == "cooling")) or 0
-    paused = db.scalar(select(func.count(Account.id)).where(Account.status == "paused")) or 0
-    unhealthy = db.scalar(select(func.count(Account.id)).where(Account.status == "unhealthy")) or 0
+    # 账号状态只分两态：正常 / 异常（口径唯一真源 services/account_status.py）。
+    # 冷却中、已暂停、停用等底层取值不再各自上报计数——同一个字段在 UI 上被拆成
+    # 四五种口径会让"正常/异常"这个唯一问题变得无法回答。
+    normal_accounts = db.scalar(select(func.count(Account.id)).where(status_case(NORMAL))) or 0
+    abnormal_accounts = db.scalar(select(func.count(Account.id)).where(status_case(ABNORMAL))) or 0
 
     today_success = db.scalar(
         select(func.count(Registration.id)).where(
@@ -50,10 +52,8 @@ def get_stats(db: Session = Depends(get_db)):
 
     return {
         "total_accounts": total_accounts,
-        "active_accounts": active_accounts,
-        "cooling": cooling,
-        "paused": paused,
-        "unhealthy": unhealthy,
+        "normal_accounts": normal_accounts,
+        "abnormal_accounts": abnormal_accounts,
         "today_success": today_success,
         "today_failed": today_failed,
         "pass_rate": round(

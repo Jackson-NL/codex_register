@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from ..db import SessionLocal, get_db
 from ..models import Account, AccountSub2APIUpload, HealthCheck, Registration, utcnow
 from ..schemas import AccountDetail, AccountOut, Sub2APIUploadSummary
+from ..services.account_status import ABNORMAL, NORMAL, status_case
 from ..services.sub2api import summarize_sub2api_upload_status
 from ..services.oauth_policy import oauth_block_reason, oauth_eligibility
 from ..services.token_utils import parse_jwt_exp
@@ -511,7 +512,16 @@ def list_accounts(
 ):
     qs = select(Account)
     if status and status != "all":
-        qs = qs.where(Account.status == status)
+        # normal / abnormal 是两态伪值（口径见 services/account_status.py）：
+        # 上层只关心「正常 / 异常」，不应知道底层有 cooling/paused/disabled 几种取值。
+        # 其余值仍按原始 status 精确匹配，保持既有调用方兼容。
+        bucket = status.strip().lower()
+        if bucket == NORMAL:
+            qs = qs.where(status_case(NORMAL))
+        elif bucket == ABNORMAL:
+            qs = qs.where(status_case(ABNORMAL))
+        else:
+            qs = qs.where(Account.status == status)
     if plan and plan != "all":
         qs = qs.where(Account.plan_type == plan)
     if q:

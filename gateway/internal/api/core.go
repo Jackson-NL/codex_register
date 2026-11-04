@@ -39,9 +39,12 @@ func (h *Handlers) AccountsList(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	where := []string{"1=1"}
 	args := []interface{}{}
-	if v := q.Get("status"); v != "" {
-		where = append(where, "status=?")
-		args = append(args, v)
+	if v := q.Get("status"); v != "" && v != "all" {
+		// normal / abnormal 走两态口径（与 backend/app/api/accounts.py 一致），
+		// 其余值仍按原始 status 精确匹配。
+		condition, conditionArgs := statusCondition(v)
+		where = append(where, condition)
+		args = append(args, conditionArgs...)
 	}
 	if v := q.Get("q"); v != "" {
 		where = append(where, "(email LIKE ? OR phone LIKE ?)")

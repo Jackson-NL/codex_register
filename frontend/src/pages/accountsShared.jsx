@@ -11,13 +11,28 @@ export const credState = (a) => {
   return { label: "凭据有效", color: "success" };
 };
 
-// 账号状态仅两态：正常（active/cooling 自动恢复）与异常（paused/unhealthy/disabled 等一切不可用）
+// 账号状态只分两态：正常 / 异常。
+// 判定口径的唯一真源是 backend/app/services/account_status.py（Go 侧同见
+// gateway/internal/api/account_status.go）；底层 accounts.status 仍有
+// active / cooling / paused / disabled 等取值，但对外一律收敛为两态：
+//   正常 = active、cooling（冷却会自动恢复，本身可用）
+//   异常 = 其余一切取值（含空值与未来新值，fail-closed）
+// 新增底层取值时不需要改这里——不在 NORMAL_STATUSES 里就自动归为异常。
+export const NORMAL_STATUSES = ["active", "cooling"];
+
+export const isNormalStatus = (status) =>
+  NORMAL_STATUSES.includes(String(status ?? "").trim().toLowerCase());
+
+export const STATUS_TEXT = { normal: "正常", abnormal: "异常" };
+
 export const ACC_STATUS = {
-  active: ["success", "正常"],
-  cooling: ["success", "正常"],
+  normal: ["success", STATUS_TEXT.normal],
+  abnormal: ["danger", STATUS_TEXT.abnormal],
 };
+
+// 传入账号对象或裸 status 字符串都可，避免调用方两种写法各写一套判定。
 export const accStatus = (a) =>
-  ACC_STATUS[a.status] || ["danger", "异常"];
+  ACC_STATUS[isNormalStatus(a && typeof a === "object" ? a.status : a) ? "normal" : "abnormal"];
 
 export const shortValue = (value, empty = "—") => value || empty;
 
@@ -44,8 +59,9 @@ export const credentialFilter = (a) => {
 export const FILTER_DEFS = {
   health: [
     { value: "all", label: "全部状态" },
-    { value: "__normal", label: "正常" },
-    { value: "__abnormal", label: "异常" },
+    // 与后端 /api/accounts?status= 的伪值同名，筛选项本身就只有两态。
+    { value: "normal", label: STATUS_TEXT.normal },
+    { value: "abnormal", label: STATUS_TEXT.abnormal },
   ],
   cred: [
     { value: "all", label: "全部凭据" },
@@ -119,11 +135,24 @@ export const CopyBtn = ({ state, title, onCopy }) => (
 
 // localStorage 视图持久化
 const VIEWS_STORAGE_KEY = "accountops-accounts-views";
+
+// 历史视图里可能存着旧的筛选值（状态曾拆成多类，异常用 __normal/__abnormal 表示）。
+// 两态改造后这些值不在选项里，直接套用会让筛选静默失效（表现为"筛了但没筛"），
+// 因此读取时做一次归一化迁移。
+const LEGACY_HEALTH_VALUES = { __normal: "normal", __abnormal: "abnormal", active: "normal" };
+
+export const normalizeViewFilters = (filters) => {
+  const next = { ...(filters || {}) };
+  if (Object.hasOwn(LEGACY_HEALTH_VALUES, next.health)) next.health = LEGACY_HEALTH_VALUES[next.health];
+  return next;
+};
+
 export const loadSavedViews = () => {
   try {
     const raw = localStorage.getItem(VIEWS_STORAGE_KEY);
     const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((view) => ({ ...view, filters: normalizeViewFilters(view?.filters) }));
   } catch { return []; }
 };
 export const persistSavedViews = (views) => {

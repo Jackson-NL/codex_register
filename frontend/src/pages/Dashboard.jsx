@@ -10,8 +10,9 @@ import { Panel, StatCard, Badge, Button, useAsyncData, Empty } from "../componen
 import { useApp } from "../context/AppContext";
 import { api } from "../api";
 import { fmtTime, fmtAgo } from "../mock/data";
+import { accStatus } from "./accountsShared";
 
-const PIE_COLORS = { active: "#208d72", cooling: "#d3a655", unhealthy: "#d76e73", paused: "#899b9c", unknown: "#a2adaf" };
+const PIE_COLORS = { normal: "#208d72", abnormal: "#d76e73" };
 const TASK_BADGE = {
   success: ["success", "已完成"],
   failed: ["danger", "失败"],
@@ -63,7 +64,10 @@ export default function Dashboard() {
 
   const { data: stats } = useAsyncData(() => api.stats.get());
   const { data: registrations } = useAsyncData(() => api.registrations.list({ limit: 200 }));
-  const { data: unhealthyAccounts } = useAsyncData(() => api.accounts.list({ status: "unhealthy" }));
+  // 异常账号清单：走两态伪值 abnormal（口径同账号页徽标）。
+  // 旧写法 status=unhealthy 查的是后端从不写入的取值，面板因此恒为"暂无异常账号"，
+  // 与账号页能看到的异常账号互相矛盾。
+  const { data: abnormalAccounts } = useAsyncData(() => api.accounts.list({ status: "abnormal" }));
 
   const trend = useMemo(() => buildTrend(registrations), [registrations]);
 
@@ -90,12 +94,12 @@ export default function Dashboard() {
   const statMetrics = useMemo(() => {
     if (!stats) return null;
     return {
-      available: stats.active_accounts ?? 0,
+      // 账号状态只有两态：正常（active/cooling）与异常（其余全部）。
+      available: stats.normal_accounts ?? 0,
+      abnormal: stats.abnormal_accounts ?? 0,
       todaySuccess: stats.today_success ?? 0,
       todayFailed: stats.today_failed ?? 0,
       passRate: stats.pass_rate ?? 0,
-      alerts: (stats.unhealthy ?? 0) + (stats.paused ?? 0),
-      cooling: stats.cooling ?? 0,
       totpCoverage: stats.totp_coverage ?? 0,
       gmailActive: stats.gmail_active_sessions ?? 0,
       gmailExpired: stats.gmail_expired_sessions ?? 0,
@@ -105,18 +109,12 @@ export default function Dashboard() {
 
   const healthDist = useMemo(() => {
     if (!stats) return [];
-    const total = stats.total_accounts ?? 0;
-    const healthy = stats.active_accounts ?? 0;
-    const cooling = stats.cooling ?? 0;
-    const unhealthy = stats.unhealthy ?? 0;
-    const paused = stats.paused ?? 0;
-    const unknown = total - healthy - cooling - unhealthy - paused;
+    const normal = stats.normal_accounts ?? 0;
+    // 兜底：后端异常时不要用减法造出虚假数字，直接用上报的 abnormal_accounts。
+    const abnormal = stats.abnormal_accounts ?? 0;
     return [
-      { name: t("健康"), key: "active", value: Math.max(0, healthy) },
-      { name: t("冷却中"), key: "cooling", value: Math.max(0, cooling) },
-      { name: t("异常"), key: "unhealthy", value: Math.max(0, unhealthy) },
-      { name: t("已暂停"), key: "paused", value: Math.max(0, paused) },
-      { name: t("未知"), key: "unknown", value: Math.max(0, unknown) },
+      { name: t("正常"), key: "normal", value: Math.max(0, normal) },
+      { name: t("异常"), key: "abnormal", value: Math.max(0, abnormal) },
     ].filter((x) => x.value > 0);
   }, [stats, t]);
 
@@ -135,8 +133,8 @@ export default function Dashboard() {
       </div>
       {/* 指标 */}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="可用账号" value={statMetrics ? statMetrics.available : "—"} sub="active 状态"
-          icon={<Users size={17} />} onClick={() => gotoWithFilter("/accounts", { health: "active" })} />
+        <StatCard label="正常 / 异常账号" value={statMetrics ? `${statMetrics.available} / ${statMetrics.abnormal}` : "—"} sub="账号状态只有这两态"
+          icon={<Users size={17} />} onClick={() => gotoWithFilter("/accounts", { health: "abnormal" })} />
         <StatCard label="今日注册成功" value={statMetrics ? statMetrics.todaySuccess : "—"} sub={statMetrics ? t(`失败 ${statMetrics.todayFailed} · 成功率 ${statMetrics.passRate}%`) : ""}
           icon={<UserCheck size={17} />} onClick={() => gotoWithFilter("/register", {})} />
         <StatCard label="2FA 覆盖率" value={statMetrics ? `${statMetrics.totpCoverage}%` : "—"} sub="已绑定 TOTP 的账号占比"
@@ -279,7 +277,7 @@ export default function Dashboard() {
         </Panel>
 
         <Panel title="需要处理的账号" className="xl:col-span-1"
-          extra={<Button variant="ghost" size="sm" onClick={() => gotoWithFilter("/accounts", { health: "unhealthy" })}>全部 →</Button>}>
+          extra={<Button variant="ghost" size="sm" onClick={() => gotoWithFilter("/accounts", { health: "abnormal" })}>全部 →</Button>}>
           <div className="-mx-4 -my-4">
             <table className="w-full text-[13px]">
               <thead>
@@ -290,13 +288,13 @@ export default function Dashboard() {
                 </tr>
               </thead>
               <tbody>
-                {(!unhealthyAccounts || unhealthyAccounts.length === 0) ? (
+                {(!abnormalAccounts || abnormalAccounts.length === 0) ? (
                   <tr><td colSpan={3} className="px-4 py-4 text-center text-xs text-slate-400">暂无异常账号</td></tr>
                 ) : (
-                  unhealthyAccounts.slice(0, 6).map((a) => (
+                  abnormalAccounts.slice(0, 6).map((a) => (
                     <tr key={a.id} className="cursor-pointer border-b border-slate-100 hover:bg-slate-50" onClick={() => gotoWithFilter("/accounts", { q: String(a.id) })}>
                       <td className="mono px-4 py-2 text-slate-700">acc_{a.id}<div className="text-[11px] text-slate-400">{a.email || a.phone || "—"}</div></td>
-                      <td className="px-3 py-2"><Badge color="danger">unhealthy</Badge></td>
+                      <td className="px-3 py-2"><Badge color={accStatus(a)[0]} dot>{accStatus(a)[1]}</Badge></td>
                       <td className="px-3 py-2">
                         <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); gotoWithFilter("/accounts", { q: String(a.id) }); }}>查看</Button>
                       </td>

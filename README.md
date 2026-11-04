@@ -25,6 +25,7 @@
 - ☁️ **Sub2API 集成**：注册成功的账号一键或自动推送到 Sub2API 管理端，支持按分组上传、状态校验与凭据同步。
 - 🩺 **账号维护**：后台周期性用 `refresh_token` 刷新 AT/RT/ID Token，并调用 `wham/usage` 探测额度写回账号表。
 - 🏷️ **账号标签**：注册批次标签自动写入新账号，账号管理页支持标签筛选与批量设置/清除。
+- 🚦 **账号状态两态**：账号只有「正常」与「异常」两种状态（正常 = `active` + `cooling`，冷却会自动恢复；其余一律异常）。列表徽标、筛选项、仪表盘分布与 `/api/stats` 全部同一口径，判定唯一真源是 `backend/app/services/account_status.py`（Go 侧 `gateway/internal/api/account_status.go`、前端 `accountsShared.jsx` 与之对齐）；底层 `accounts.status` 仍保留 `paused` / `disabled` 等取值以支撑暂停与冷却行为，但不再作为对外分类展示。
 
 ## 🛡️ 风控对抗
 

@@ -17,10 +17,10 @@ func (h *Handlers) GetStats(w http.ResponseWriter, r *http.Request) {
 		return n
 	}
 	totalAccounts := row("SELECT COUNT(*) FROM accounts")
-	activeAccounts := row("SELECT COUNT(*) FROM accounts WHERE status='active'")
-	cooling := row("SELECT COUNT(*) FROM accounts WHERE status='cooling'")
-	paused := row("SELECT COUNT(*) FROM accounts WHERE status='paused'")
-	unhealthy := row("SELECT COUNT(*) FROM accounts WHERE status='unhealthy'")
+	// 账号状态只分两态：正常 / 异常（与 backend/app/api/stats.py、
+	// internal/api/account_status.go 同一口径）。底层取值仍多样，但不再分别上报计数。
+	normalAccounts := row(statusCountQuery(statusNormal))
+	abnormalAccounts := row(statusCountQuery(statusAbnormal))
 	todaySuccess := row("SELECT COUNT(*) FROM registrations WHERE status='success' AND date(finished_at)=date('now','localtime')")
 	todayFailed := row("SELECT COUNT(*) FROM registrations WHERE status='failed' AND date(finished_at)=date('now','localtime')")
 	running := row("SELECT COUNT(*) FROM registrations WHERE status IN ('pending','running')")
@@ -43,10 +43,8 @@ func (h *Handlers) GetStats(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"total_accounts":         totalAccounts,
-		"active_accounts":        activeAccounts,
-		"cooling":                cooling,
-		"paused":                 paused,
-		"unhealthy":              unhealthy,
+		"normal_accounts":        normalAccounts,
+		"abnormal_accounts":      abnormalAccounts,
 		"today_success":          todaySuccess,
 		"today_failed":           todayFailed,
 		"pass_rate":              passRate,
